@@ -1,0 +1,11 @@
+#!/bin/bash
+# Development wrapper for mcp-vector-search running from source
+
+# Configuration
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Change to project directory for uv to find pyproject.toml
+cd "${PROJECT_DIR}"
+
+# Run with uv
+exec uv run mcp-vector-search "$@"
