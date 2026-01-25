@@ -422,6 +422,9 @@ class SemanticIndexer:
             files_to_index = all_files
         else:
             files_to_index = [f for f in all_files if self._needs_reindexing(f, metadata)]
+            skipped_count = len(all_files) - len(files_to_index)
+            if skipped_count > 0:
+                logger.info(f"[HIZ] ⚡ MD5 İmzası Eşleşti: {skipped_count} değişmemiş dosya atlandı (Senkronizasyon anlık tamamlandı).")
 
         if not files_to_index:
             logger.info("All files are up to date")
