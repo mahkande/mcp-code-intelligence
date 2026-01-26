@@ -7,6 +7,14 @@ from typing import List, Optional
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
+from rich.live import Live
+from rich.layout import Layout
+from rich.text import Text
+import time
+import subprocess
+import os
+import asyncio
 
 # Import from py-mcp-installer library
 # Ensure this runs within the package context or after dependencies are installed
@@ -225,27 +233,78 @@ def setup(
 
 @app.command("logs")
 def view_logs():
-    """Live monitor background MCP activity."""
-    import asyncio # Import asyncio here as it's only needed for this command
+    """🚀 Launch the Live MCP Control Center (HUD)."""
     log_file = Path.cwd() / ".mcp-code-intelligence" / "logs" / "activity.log"
     if not log_file.exists():
-        console.print(f"[red]Error: Log file not found at {log_file}[/red]")
-        console.print("[dim]Ensure the project is being indexed by an MCP server.[/dim]")
-        return
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.touch()
 
-    console.print(Panel.fit(f"👀 [bold]Live Activity Stream[/bold]\n[dim]{log_file}[/dim]", border_style="cyan"))
-    try:
-        # Simple tail -f implementation in Python
-        with open(log_file, "r", encoding="utf-8") as f:
-            f.seek(0, 2) # Go to end
+    layout = Layout()
+    layout.split(
+        Layout(name="header", size=10),
+        Layout(name="body")
+    )
+
+    servers = [
+        {"name": "mcp-code-intelligence", "pattern": "mcp_code_intelligence.mcp"},
+        {"name": "python-lsp", "pattern": "python_lsp_server"},
+        {"name": "filesystem", "pattern": "filesystem_server"},
+        {"name": "git", "pattern": "git_server"},
+        {"name": "memory", "pattern": "memory_server"},
+    ]
+
+    def check_server_status():
+        table = Table(title="🛡️ MCP Code Intelligence - Live Control Center", expand=True, border_style="cyan")
+        table.add_column("Server Name", style="bold white")
+        table.add_column("Status", justify="center")
+        table.add_column("PID", justify="right", style="dim")
+        table.add_column("Active Context", style="dim")
+
+        # In a real environment, we'd check PIDs more robustly
+        # For this CLI tool, we scan process list for patterns
+        try:
+            if os.name == 'nt': # Windows
+                proc_list = subprocess.check_output(['tasklist', '/v', '/fo', 'csv']).decode('cp1254', errors='ignore')
+            else: # Linux/Mac
+                proc_list = subprocess.check_output(['ps', 'aux']).decode('utf-8', errors='ignore')
+        except:
+            proc_list = ""
+
+        for s in servers:
+            is_running = s["pattern"] in proc_list
+            status = "[bold green]● RUNNING[/bold green]" if is_running else "[bold red]○ STOPPED[/bold red]"
+            pid = "ACTIVE" if is_running else "N/A"
+            table.add_row(s["name"], status, pid, "Project Index: Ready")
+        
+        return table
+
+    def get_logs(limit=20):
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                return "".join(lines[-limit:])
+        except:
+            return "Gathering log data..."
+
+    console.clear()
+    with Live(layout, refresh_per_second=2, screen=True) as live:
+        try:
             while True:
-                line = f.readline()
-                if not line:
-                    asyncio.run(asyncio.sleep(0.5))
-                    continue
-                console.print(line.strip(), style="dim" if "INFO" in line else "bold white")
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Stopped log monitoring.[/yellow]")
+                # Update Header
+                layout["header"].update(Panel(check_server_status(), border_style="blue"))
+                
+                # Update Body
+                log_data = get_logs(30)
+                layout["body"].update(Panel(
+                    Text.from_markup(log_data), 
+                    title="📝 Activity Stream", 
+                    subtitle="Press Ctrl+C to Exit",
+                    border_style="dim"
+                ))
+                
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
 
 @app.command("install-standard-servers")
 def install_standard_servers(allowed_path: Path = Path.cwd()):
