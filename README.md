@@ -94,7 +94,7 @@ The Guardian system is enabled by default to keep your codebase clean. You can m
 
 - **Disable Guardian:** `mcp-code-intelligence config set enable_guardian false`
 - **Enable Guardian:** `mcp-code-intelligence config set enable_guardian true`
-- **Tottle Logic Check:** `mcp-code-intelligence config set enable_logic_check false`
+- **Toggle Logic Check:** `mcp-code-intelligence config set enable_logic_check false`
 - **Ignore specific code:** Add `# guardian-ignore` as a comment inside any function or class to skip health checks for that block.
 
 ---
