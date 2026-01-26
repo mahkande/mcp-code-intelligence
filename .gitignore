@@ -7,6 +7,7 @@
 .cursor/
 *.json.bak
 chunk-graph.json
+guardian_state.json
 
 # --- Internal Dev Summaries (Hidden from GitHub) ---
 CHANGELOG.md
@@ -25,9 +26,7 @@ mcp-code-intelligence-dev
 # --- Unnecessary Node/Config Files ---
 npm_search.json
 package.json
-package-lock.json
 pyrightconfig.json
-node_modules/
 
 # --- Core Dotfiles ---
 .*
@@ -77,13 +76,14 @@ var/
 wheels/
 share/python-wheels/
 *.egg-info/
-.installed.cfg
+.installed-cfg
 *.egg
 MANIFEST
 .venv
 venv/
 ENV/
 .env
+.python-version
 
 # --- JavaScript / Node ---
 node_modules/
@@ -116,3 +116,5 @@ logs/
 *.backup
 tmp/
 temp/
+*.tmp
+*.temp

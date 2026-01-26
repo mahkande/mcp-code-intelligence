@@ -37,6 +37,11 @@ Our **Smart Chunking** and **Semantic Retrieval** strategy dramatically reduces 
   - **Rust / Go / C++:** Fully supported high-performance LSPs.
 - **⚡ Smart Priority Indexing:** Large project? No problem. The system indexes your **Git changes**, **Entry Points**, and **READMEs** in the first 60 seconds, so you can start working while the rest finishes in the background.
 - **🏠 100% Local Intelligence:** All vector operations and embeddings stay on your machine. No code ever leaves your project.
+- **🛡️ Project Health Guardian (Smart Notifications):** The system continuously monitors your project for technical debt. It injects non-intrusive warnings into your AI chat when exact duplicates or empty placeholders (`pass`/`...`) are detected, helping you maintain a clean codebase in real-time.
+- **🕵️ Three-Level Duplicate Detection:** Go beyond simple text matching with:
+  - **Level 3 (Exact):** MD5/SHA256 hash matching for copy-paste detection.
+  - **Level 2 (Structural):** AST-based skeleton analysis (different names, same algorithm).
+  - **Level 1 (Semantic):** Jina v3 AI analysis to find different code performing the same task.
 
 ---
 
@@ -70,6 +75,7 @@ The smart setup will:
 - `mcp-code-intelligence setup`: The recommended way to start. Auto-detects everything and configures your environment.
 - `mcp-code-intelligence search "query"`: Semantic search using natural language.
 - `mcp-code-intelligence chat "question"`: Interactive LLM chat about your codebase (requires OpenRouter API key).
+- `mcp-code-intelligence duplicates`: Run a high-precision, 3-level scan for duplicate code blocks.
 - `mcp-code-intelligence analyze`: Run complexity and quality analysis (Cognitive/Cyclomatic complexity, Code Smells).
 
 ### 📊 Status & Visualization
@@ -81,7 +87,17 @@ The smart setup will:
 - `mcp-code-intelligence index`: Manually trigger or force re-indexing of the codebase.
 - `mcp-code-intelligence reset`: Clean slate. Deletes existing indexes and restores factory settings.
 - `mcp-code-intelligence config`: Fine-tune settings like `similarity_threshold` or change embedding models.
+- `mcp-code-intelligence silence_health_issue <ID>`: Manually mute a specific health warning by its ID.
 
+### 🛡️ Managing the Health Guardian
+The Guardian system is enabled by default to keep your codebase clean. You can manage it via CLI:
+
+- **Disable Guardian:** `mcp-code-intelligence config set enable_guardian false`
+- **Enable Guardian:** `mcp-code-intelligence config set enable_guardian true`
+- **Tottle Logic Check:** `mcp-code-intelligence config set enable_logic_check false`
+- **Ignore specific code:** Add `# guardian-ignore` as a comment inside any function or class to skip health checks for that block.
+
+---
 ### 📺 Monitoring
 - `mcp-code-intelligence onboarding logs`: **The Live Dashboard.** Monitor background activities, search logs, and AI tool interactions in real-time.
 

@@ -119,6 +119,7 @@ explore unfamiliar projects, and integrate with AI coding tools via MCP.
 from .commands.analyze import analyze_app  # noqa: E402
 from .commands.chat import chat_app  # noqa: E402
 from .commands.config import config_app  # noqa: E402
+from .commands.duplicates import app as duplicates_app  # noqa: E402
 from .commands.demo import demo_app  # noqa: E402
 from .commands.index import index_app  # noqa: E402
 from .commands.init import init_app  # noqa: E402
@@ -191,6 +192,11 @@ app.add_typer(
 # 12. VISUALIZE - Code graph visualization
 app.add_typer(
     visualize_app, name="visualize", help="📊 Visualize code chunk relationships"
+)
+
+# 12.5. DUPLICATES - Duplicate code detection
+app.add_typer(
+    duplicates_app, name="duplicates", help="🕵️ Detect duplicate code at multiple levels"
 )
 
 # 13. ONBOARDING - Standard MCP server setup

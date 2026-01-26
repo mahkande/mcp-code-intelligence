@@ -164,6 +164,12 @@ class MCPVectorSearchServer:
                 reranker_model_name=config.reranker_model,
             )
 
+            # Initialize Guardian Manager for project health monitoring
+            from ..analysis.guardian import GuardianManager
+            self.guardian = GuardianManager(self.database, self.project_root)
+            self._enable_guardian = config.enable_guardian
+            self._enable_logic_check = config.enable_logic_check
+
             # Setup indexer for file watching
             if self.enable_file_watching:
                 self.indexer = SemanticIndexer(
@@ -509,6 +515,52 @@ class MCPVectorSearchServer:
                     "required": ["analysis_json"],
                 },
             ),
+            Tool(
+                name="find_duplicates",
+                description="Scan the codebase for duplicate code blocks using three levels of detection: Semantic (AI), Structural (AST), and Exact (MD5). Provides a detailed report with refactoring suggestions to reduce technical debt.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "min_length": {
+                            "type": "integer",
+                            "description": "Minimum character length of code block to consider",
+                            "default": 100
+                        }
+                    }
+                },
+            ),
+            Tool(
+                name="silence_health_issue",
+                description="Manually silence a specific health issue (duplicate, empty body, etc.) using its unique Issue ID. Once silenced, the issue will no longer appear in Guardian notices. Use this when an issue is intentional or a false positive.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "issue_id": {
+                            "type": "string",
+                            "description": "The unique ID of the issue to silence (e.g., 'EmptyBody:func:123')"
+                        }
+                    },
+                    "required": ["issue_id"]
+                },
+            ),
+            Tool(
+                name="propose_logic",
+                description="CRITICAL: Use this tool BEFORE implementing any new helper function, utility, or business logic. It checks if similar logic already exists in the codebase to prevent duplication. Provide a description of what the code should do (intent) and optionally a draft of the code.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "intent": {
+                            "type": "string",
+                            "description": "The goal or purpose of the logic (e.g., 'format currency as USD')"
+                        },
+                        "code_draft": {
+                            "type": "string",
+                            "description": "Optional draft or pseudocode of the implementation"
+                        }
+                    },
+                    "required": ["intent"]
+                },
+            ),
         ]
 
         return tools
@@ -524,32 +576,46 @@ class MCPVectorSearchServer:
             await self.initialize()
 
         try:
+            # Execute the actual tool
+            result: CallToolResult
             if request.params.name == "search_code":
-                return await self._search_code(request.params.arguments)
+                result = await self._search_code(request.params.arguments)
             elif request.params.name == "search_similar":
-                return await self._search_similar(request.params.arguments)
+                result = await self._search_similar(request.params.arguments)
             elif request.params.name == "search_context":
-                return await self._search_context(request.params.arguments)
+                result = await self._search_context(request.params.arguments)
             elif request.params.name == "get_project_status":
-                return await self._get_project_status(request.params.arguments)
+                result = await self._get_project_status(request.params.arguments)
             elif request.params.name == "index_project":
-                return await self._index_project(request.params.arguments)
+                result = await self._index_project(request.params.arguments)
             elif request.params.name == "analyze_project":
-                return await self._analyze_project(request.params.arguments)
+                result = await self._analyze_project(request.params.arguments)
             elif request.params.name == "analyze_file":
-                return await self._analyze_file(request.params.arguments)
+                result = await self._analyze_file(request.params.arguments)
             elif request.params.name == "find_smells":
-                return await self._find_smells(request.params.arguments)
+                result = await self._find_smells(request.params.arguments)
             elif request.params.name == "get_complexity_hotspots":
-                return await self._get_complexity_hotspots(request.params.arguments)
+                result = await self._get_complexity_hotspots(request.params.arguments)
             elif request.params.name == "check_circular_dependencies":
-                return await self._check_circular_dependencies(request.params.arguments)
+                result = await self._check_circular_dependencies(request.params.arguments)
             elif request.params.name == "find_symbol":
-                return await self._find_symbol(request.params.arguments)
+                result = await self._find_symbol(request.params.arguments)
             elif request.params.name == "get_relationships":
-                return await self._get_relationships(request.params.arguments)
+                result = await self._get_relationships(request.params.arguments)
             elif request.params.name == "interpret_analysis":
-                return await self._interpret_analysis(request.params.arguments)
+                result = await self._interpret_analysis(request.params.arguments)
+            elif request.params.name == "find_duplicates":
+                from .duplicates_tool import handle_find_duplicates
+                result = await handle_find_duplicates(self.search_engine, request.params.arguments)
+            elif request.params.name == "silence_health_issue":
+                issue_id = request.params.arguments.get("issue_id")
+                success = await self.guardian.silence_issue(issue_id)
+                if success:
+                    result = CallToolResult(content=[TextContent(type="text", text=f"✅ Issue '{issue_id}' has been silenced. It will no longer appear in Guardian notices.")])
+                else:
+                    result = CallToolResult(content=[TextContent(type="text", text=f"ℹ️ Issue '{issue_id}' was already silenced or could not be found.")])
+            elif request.params.name == "propose_logic":
+                return await self._handle_propose_logic(request.params.arguments)
             else:
                 return CallToolResult(
                     content=[
@@ -559,6 +625,22 @@ class MCPVectorSearchServer:
                     ],
                     isError=True,
                 )
+
+            # --- GUARDIAN SMART NOTIFICATION INJECTION ---
+            # If the tool call was successful and it's a primary interaction tool, check for health notices
+            if self._enable_guardian and not result.isError and request.params.name in ("search_code", "search_similar", "get_project_status"):
+                try:
+                    # Guardian check can be throttled or fast-scanned
+                    health_notice = await self.guardian.get_health_notice()
+                    if health_notice:
+                        # Prepend the notice to the response content
+                        notice_content = TextContent(type="text", text=health_notice + "\n\n---\n")
+                        result.content.insert(0, notice_content)
+                except Exception as g_err:
+                    logger.debug(f"Guardian check failed: {g_err}")
+
+            return result
+
         except Exception as e:
             logger.error(f"Tool call failed: {e}")
             return CallToolResult(
@@ -1661,6 +1743,52 @@ class MCPVectorSearchServer:
         else:
             # Standard (default)
             return ThresholdConfig()
+
+    async def _handle_propose_logic(self, args: dict[str, Any]) -> CallToolResult:
+        """Handle propose_logic tool call to prevent duplication."""
+        if not self._enable_logic_check:
+            return CallToolResult(
+                content=[TextContent(type="text", text="ℹ️ Logic Check feature is currently disabled in project configuration.")]
+            )
+
+        intent = args.get("intent", "")
+        code_draft = args.get("code_draft")
+
+        if not intent:
+            return CallToolResult(
+                content=[TextContent(type="text", text="Intent is required.")],
+                isError=True,
+            )
+
+        analysis = await self.guardian.check_intent_duplication(intent, code_draft)
+        
+        if not analysis["duplicate_found"]:
+            return CallToolResult(
+                content=[TextContent(type="text", text="✅ No similar logic found. You can proceed with the implementation.")]
+            )
+        
+        # Format the Blocker Notice
+        response_lines = [
+            "### 🛑 STOP! LOGIC DUPLICATION DETECTED",
+            "\n> [!CAUTION]",
+            "> **Highly similar logic already exists in your codebase.**",
+            "> Implementing this again would create technical debt. Please use the existing implementation below:\n"
+        ]
+        
+        for i, match in enumerate(analysis["matches"], 1):
+            func = match['function_name'] or "Global/Block"
+            response_lines.append(f"#### 🔍 Match {i} (Confidence: {match['score']:.2f})")
+            response_lines.append(f"- **File:** `{match['file_path']}`")
+            response_lines.append(f"- **Symbol:** `{func}`")
+            response_lines.append(f"- **Location:** `{match['location']}`")
+            response_lines.append("\n**Existing Code Snippet:**")
+            response_lines.append(f"```python\n{match['content'][:400]}...\n```\n")
+        
+        response_lines.append("\n---")
+        response_lines.append("> [!TIP]")
+        response_lines.append("> Instead of writing new code, please **import and reuse** the existing logic.")
+
+        return CallToolResult(content=[TextContent(type="text", text="\n".join(response_lines))])
 
 
 def create_mcp_server(

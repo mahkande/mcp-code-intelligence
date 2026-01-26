@@ -85,6 +85,14 @@ class ProjectConfig(BaseSettings):
         default=False,
         description="If True, only index core source files and skip others like documentation (Optional user flag)",
     )
+    enable_guardian: bool = Field(
+        default=True,
+        description="Enable Project Health Guardian monitoring and notifications",
+    )
+    enable_logic_check: bool = Field(
+        default=True,
+        description="Enable proactive logic duplication checking via propose_logic tool",
+    )
 
     @field_validator("project_root", "index_path", mode="before")
     @classmethod

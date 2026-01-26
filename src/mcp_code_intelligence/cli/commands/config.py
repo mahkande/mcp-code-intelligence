@@ -264,6 +264,8 @@ def _parse_config_value(key: str, value: str):
         "respect_gitignore",
         "auto_reindex_on_upgrade",
         "index_important_only",
+        "enable_guardian",
+        "enable_logic_check",
     ]:
         return value.lower() in ("true", "yes", "1", "on")
 
@@ -333,6 +335,8 @@ def _get_default_value(key: str):
         "throttle_delay": 0.5,
         "max_file_size_kb": 10240,
         "index_important_only": False,
+        "enable_guardian": True,
+        "enable_logic_check": True,
     }
 
     return defaults.get(key, "")
@@ -358,6 +362,8 @@ def _show_available_keys() -> None:
         ("throttle_delay", "Delay between batches (seconds)", "float"),
         ("max_file_size_kb", "Max file size in KB to index", "integer"),
         ("index_important_only", "Only index core source files", "boolean"),
+        ("enable_guardian", "Enable Project Health Guardian monitoring", "boolean"),
+        ("enable_logic_check", "Enable proactive logic duplication checks", "boolean"),
     ]
 
     for key, description, value_type in keys_info:
