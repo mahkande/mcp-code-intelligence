@@ -316,18 +316,22 @@ class ProjectManager:
         Returns:
             List of source file paths
         """
+        import os
         files = []
 
-        for path in self.project_root.rglob("*"):
-            if not path.is_file():
-                continue
+        for root, dirs, filenames in os.walk(self.project_root, topdown=True):
+            # Optimization: Filter directories IN-PLACE to skip ignored ones
+            dirs[:] = [
+                d for d in dirs
+                if not self._should_ignore_path(Path(root) / d, is_directory=True)
+            ]
 
-            # Skip ignored patterns
-            # PERFORMANCE: Pass is_directory=False since we already checked is_file()
-            if self._should_ignore_path(path, is_directory=False):
-                continue
-
-            files.append(path)
+            for filename in filenames:
+                path = Path(root) / filename
+                # Files are already filtered by directory pruning, 
+                # but we check the file itself just in case of file-specific ignore patterns
+                if not self._should_ignore_path(path, is_directory=False):
+                    files.append(path)
 
         return files
 

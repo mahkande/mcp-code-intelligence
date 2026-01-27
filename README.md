@@ -103,6 +103,32 @@ The Guardian system is enabled by default to keep your codebase clean. You can m
 
 ---
 
+## 🗑️ Nasıl Kaldırılır? (Uninstall)
+
+Eğer MCP Code Intelligence entegrasyonu editörünüzde sorun çıkarırsa veya kaldırmak isterseniz, aşağıdaki komutları kullanabilirsiniz:
+
+- **Otomatik kaldırma (en çok tespit edilen platform):**
+  ```sh
+  mcp-code-intelligence uninstall mcp
+  ```
+- **Belirli bir editörden kaldırma:**
+  ```sh
+  mcp-code-intelligence uninstall mcp --platform cursor
+  mcp-code-intelligence uninstall mcp --platform claude-desktop
+  ```
+- **Tüm platformlardan topluca kaldırma:**
+  ```sh
+  mcp-code-intelligence uninstall mcp --all
+  ```
+- **Mevcut entegrasyonları listele:**
+  ```sh
+  mcp-code-intelligence uninstall list
+  ```
+
+Kaldırma işlemi sonrası editörünüzü yeniden başlatmanız önerilir.
+
+---
+
 ## 🛠️ Requirements
 - **Python 3.10+**
 - **Git** (for smart prioritization)

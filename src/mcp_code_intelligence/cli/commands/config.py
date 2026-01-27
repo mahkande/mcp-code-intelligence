@@ -266,6 +266,7 @@ def _parse_config_value(key: str, value: str):
         "index_important_only",
         "enable_guardian",
         "enable_logic_check",
+        "disable_server_llm",
     ]:
         return value.lower() in ("true", "yes", "1", "on")
 

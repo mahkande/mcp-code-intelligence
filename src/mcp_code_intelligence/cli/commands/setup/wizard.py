@@ -10,28 +10,21 @@ class SetupWizard:
 
     def show_header(self):
         """Prints the setup header."""
-        self.console.print(
-            Panel.fit(
-                "[bold cyan]🚀 Smart Setup for mcp-code-intelligence[/bold cyan]\n"
-                "[dim]Zero-config installation with auto-detection[/dim]",
-                border_style="cyan",
-            )
-        )
+        self.console.print("\n[bold cyan]🚀 Smart Setup for mcp-code-intelligence[/bold cyan]")
+        self.console.print("[dim]Zero-config installation with auto-detection[/dim]\n")
 
     def show_discovery_summary(self, project_name: str, languages: list, tools: list, planned_actions: list):
         """Displays a summary of detected items and planned actions."""
-        summary_panel = [
-            f"[bold]Project:[/bold] {project_name}",
-            f"[bold]Detected Languages:[/bold] {', '.join(languages) if languages else 'Generic'}",
-            f"[bold]Detected AI Tools:[/bold] {', '.join(tools) if tools else 'None'}",
-            "",
-            "[bold cyan]Planned Actions:[/bold cyan]"
-        ]
+        self.console.print(f"[bold cyan]--- Setup Summary ---[/bold cyan]")
+        self.console.print(f"[bold]Project:[/bold] {project_name}")
+        self.console.print(f"[bold]Detected Languages:[/bold] {', '.join(languages) if languages else 'Generic'}")
+        self.console.print(f"[bold]Detected AI Tools:[/bold] {', '.join(tools) if tools else 'None'}")
+        self.console.print("")
+        self.console.print("[bold cyan]Planned Actions:[/bold cyan]")
         
         for action in planned_actions:
-            summary_panel.append(f"• {action}")
-            
-        self.console.print(Panel("\n".join(summary_panel), title="🚀 Setup Summary", border_style="green"))
+            self.console.print(f" • {action}")
+
 
     def confirm_execution(self) -> bool:
         """Asks for user confirmation before proceeding."""

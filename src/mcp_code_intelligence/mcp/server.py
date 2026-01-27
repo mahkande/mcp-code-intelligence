@@ -31,7 +31,15 @@ from ..core.indexer import SemanticIndexer
 from ..core.project import ProjectManager
 from ..core.search import SemanticSearchEngine
 from ..core.watcher import FileWatcher
+from ..core.llm_client import LLMClient
+from ..core.config_utils import (
+    get_openai_api_key,
+    get_openrouter_api_key,
+    get_preferred_llm_provider,
+)
 from ..parsers.registry import ParserRegistry
+from ..core.lsp_proxy import get_manager, stop_proxies
+from ..core import formatters
 
 
 class MCPVectorSearchServer:
@@ -68,7 +76,7 @@ class MCPVectorSearchServer:
 
         self.project_root = project_root
         self.project_manager = ProjectManager(self.project_root)
-        
+
         # Setup activity logging
         self._setup_logging()
 
@@ -76,6 +84,7 @@ class MCPVectorSearchServer:
         self.file_watcher: FileWatcher | None = None
         self.indexer: SemanticIndexer | None = None
         self.database: ChromaVectorDatabase | None = None
+        self.llm_client: LLMClient | None = None
         self._initialized = False
 
         # Determine if file watching should be enabled
@@ -92,12 +101,12 @@ class MCPVectorSearchServer:
             log_dir = self.project_root / ".mcp-code-intelligence" / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_file = log_dir / "activity.log"
-            
+
             # Add file logger (keep last 5MB of logs, rotation)
             logger.add(
-                log_file, 
-                rotation="5 MB", 
-                retention="1 week", 
+                log_file,
+                rotation="5 MB",
+                retention="1 week",
                 level="INFO",
                 format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"
             )
@@ -134,12 +143,12 @@ class MCPVectorSearchServer:
             try:
                 collection = self.database.get_collection()
                 chunk_count = collection.count()
-                
+
                 if chunk_count == 0:
                     logger.info("Index is empty, starting automatic indexing...")
                     # Import indexing functionality
                     from ..cli.commands.index import run_indexing
-                    
+
                     # Run indexing with conservative settings to prevent system freezes
                     await run_indexing(
                         project_root=self.project_root,
@@ -163,6 +172,32 @@ class MCPVectorSearchServer:
                 project_root=self.project_root,
                 reranker_model_name=config.reranker_model,
             )
+
+            # Optionally create an LLM client and attach the search engine so server-side
+            # components can use context injection when making LLM calls. Only create
+            # the client if API keys are available in project config or environment.
+            try:
+                config_dir = self.project_root / ".mcp-code-intelligence"
+                openai_key = get_openai_api_key(config_dir)
+                openrouter_key = get_openrouter_api_key(config_dir)
+                preferred = get_preferred_llm_provider(config_dir)
+
+                if openai_key or openrouter_key:
+                    self.llm_client = LLMClient(
+                        openai_api_key=openai_key,
+                        openrouter_api_key=openrouter_key,
+                        provider=preferred if preferred in ("openai", "openrouter") else None,
+                    )
+                    # Attach search engine for context injection
+                    try:
+                        self.llm_client.search_engine = self.search_engine
+                    except Exception:
+                        pass
+                    logger.info("LLM client initialized and attached to search engine for context injection")
+                else:
+                    logger.debug("No LLM API keys found; skipping LLM client initialization in MCP server")
+            except Exception as e:
+                logger.warning(f"Failed to initialize LLM client in server: {e}")
 
             # Initialize Guardian Manager for project health monitoring
             from ..analysis.guardian import GuardianManager
@@ -219,351 +254,50 @@ class MCPVectorSearchServer:
         self.search_engine = None
         self.indexer = None
         self._initialized = False
+        # Stop any running LSP proxies for this project
+        try:
+            await stop_proxies(self.project_root)
+        except Exception:
+            logger.debug("Failed to stop LSP proxies during cleanup")
         logger.info("MCP server cleanup completed")
 
     def get_tools(self) -> list[Tool]:
-        """Get available MCP tools."""
-        tools = [
-            Tool(
-                name="search_code",
-                description="Search codebase using natural language queries (text-to-code search). Use when you know what functionality you're looking for but not where it's implemented. Example: 'authentication middleware' or 'database connection pooling' to find relevant code.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query to find relevant code",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return",
-                            "default": 10,
-                            "minimum": 1,
-                            "maximum": 50,
-                        },
-                        "similarity_threshold": {
-                            "type": "number",
-                            "description": "Minimum similarity threshold (0.0-1.0)",
-                            "default": 0.3,
-                            "minimum": 0.0,
-                            "maximum": 1.0,
-                        },
-                        "file_extensions": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Filter by file extensions (e.g., ['.py', '.js'])",
-                        },
-                        "language": {
-                            "type": "string",
-                            "description": "Filter by programming language",
-                        },
-                        "function_name": {
-                            "type": "string",
-                            "description": "Filter by function name",
-                        },
-                        "class_name": {
-                            "type": "string",
-                            "description": "Filter by class name",
-                        },
-                        "files": {
-                            "type": "string",
-                            "description": "Filter by file patterns (e.g., '*.py' or 'src/*.js')",
-                        },
-                    },
-                    "required": ["query"],
-                },
-            ),
-            Tool(
-                name="search_similar",
-                description="Find code snippets similar to a specific file or function (code-to-code similarity). Use when looking for duplicate code, similar patterns, or related implementations. Example: 'Find functions similar to auth_handler.py' to discover related authentication code.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "Path to the file to find similar code for",
-                        },
-                        "function_name": {
-                            "type": "string",
-                            "description": "Optional function name within the file",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return",
-                            "default": 10,
-                            "minimum": 1,
-                            "maximum": 50,
-                        },
-                        "similarity_threshold": {
-                            "type": "number",
-                            "description": "Minimum similarity threshold (0.0-1.0)",
-                            "default": 0.3,
-                            "minimum": 0.0,
-                            "maximum": 1.0,
-                        },
-                    },
-                    "required": ["file_path"],
-                },
-            ),
-            Tool(
-                name="find_symbol",
-                description="Find exact code definitions (class or function) by name. Use this for 'symbolic' pinpointing when you know the exact name of the symbol you're looking for. This bypasses semantic search for 100% accuracy on structured queries. Example: 'find_symbol(name=\"UserRepository\")' to find the class definition.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "The exact name of the function or class to find",
-                        },
-                        "symbol_type": {
-                            "type": "string",
-                            "description": "Optional filter: 'class' or 'function'",
-                            "enum": ["class", "function"],
-                        },
-                    },
-                    "required": ["name"],
-                },
-            ),
-            Tool(
-                name="get_relationships",
-                description="Explore structural and semantic relationships for a code symbol. Returns who calls it (callers), what it calls (callees), and conceptually similar code (siblings). Use this to understand the 'neighborhood' of a class or function within the codebase. Example: 'get_relationships(name=\"AuthManager\")' to see its usage and similar patterns.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "The exact name of the function or class to explore",
-                        }
-                    },
-                    "required": ["name"],
-                },
-            ),
-            Tool(
-                name="search_context",
-                description="Search for code using rich contextual descriptions with optional focus areas. Use when you need broader context around specific concerns. Example: 'code handling user sessions' with focus_areas=['security', 'authentication'] to find session management with security emphasis.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "description": {
-                            "type": "string",
-                            "description": "Contextual description of what you're looking for",
-                        },
-                        "focus_areas": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Areas to focus on (e.g., ['security', 'authentication'])",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return",
-                            "default": 10,
-                            "minimum": 1,
-                            "maximum": 50,
-                        },
-                    },
-                    "required": ["description"],
-                },
-            ),
-            Tool(
-                name="get_project_status",
-                description="Get project indexing status and statistics",
-                inputSchema={"type": "object", "properties": {}, "required": []},
-            ),
-            Tool(
-                name="index_project",
-                description="Index or reindex the project codebase",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "force": {
-                            "type": "boolean",
-                            "description": "Force reindexing even if index exists",
-                            "default": False,
-                        },
-                        "file_extensions": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "File extensions to index (e.g., ['.py', '.js'])",
-                        },
-                        "workers": {
-                            "type": "integer",
-                            "description": "Maximum number of worker processes for parsing",
-                        },
-                        "throttle": {
-                            "type": "number",
-                            "description": "Delay in seconds between batches to reduce CPU load",
-                        },
-                        "max_size": {
-                            "type": "integer",
-                            "description": "Maximum file size in KB to index",
-                        },
-                        "important_only": {
-                            "type": "boolean",
-                            "description": "Only index core source files",
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            Tool(
-                name="analyze_project",
-                description="Returns project-wide metrics summary",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "threshold_preset": {
-                            "type": "string",
-                            "description": "Threshold preset: 'strict', 'standard', or 'relaxed'",
-                            "enum": ["strict", "standard", "relaxed"],
-                            "default": "standard",
-                        },
-                        "output_format": {
-                            "type": "string",
-                            "description": "Output format: 'summary' or 'detailed'",
-                            "enum": ["summary", "detailed"],
-                            "default": "summary",
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            Tool(
-                name="analyze_file",
-                description="Returns file-level metrics",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "Path to the file to analyze (relative or absolute)",
-                        },
-                    },
-                    "required": ["file_path"],
-                },
-            ),
-            Tool(
-                name="find_smells",
-                description="Identify code quality issues, anti-patterns, bad practices, and technical debt. Detects Long Methods, Deep Nesting, Long Parameter Lists, God Classes, and Complex Methods. Use when assessing code quality, finding refactoring opportunities, or identifying maintainability issues.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "smell_type": {
-                            "type": "string",
-                            "description": "Filter by smell type: 'Long Method', 'Deep Nesting', 'Long Parameter List', 'God Class', 'Complex Method'",
-                            "enum": [
-                                "Long Method",
-                                "Deep Nesting",
-                                "Long Parameter List",
-                                "God Class",
-                                "Complex Method",
-                            ],
-                        },
-                        "severity": {
-                            "type": "string",
-                            "description": "Filter by severity level",
-                            "enum": ["info", "warning", "error"],
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            Tool(
-                name="get_complexity_hotspots",
-                description="Returns top N most complex functions",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of hotspots to return",
-                            "default": 10,
-                            "minimum": 1,
-                            "maximum": 50,
-                        },
-                    },
-                    "required": [],
-                },
-            ),
-            Tool(
-                name="check_circular_dependencies",
-                description="Returns circular dependency cycles",
-                inputSchema={"type": "object", "properties": {}, "required": []},
-            ),
-            Tool(
-                name="interpret_analysis",
-                description="Interpret analysis results with natural language explanations and recommendations",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "analysis_json": {
-                            "type": "string",
-                            "description": "JSON string from analyze command with --include-context",
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": "Focus area: 'summary', 'recommendations', or 'priorities'",
-                            "enum": ["summary", "recommendations", "priorities"],
-                            "default": "summary",
-                        },
-                        "verbosity": {
-                            "type": "string",
-                            "description": "Verbosity level: 'brief', 'normal', or 'detailed'",
-                            "enum": ["brief", "normal", "detailed"],
-                            "default": "normal",
-                        },
-                    },
-                    "required": ["analysis_json"],
-                },
-            ),
-            Tool(
-                name="find_duplicates",
-                description="Scan the codebase for duplicate code blocks using three levels of detection: Semantic (AI), Structural (AST), and Exact (MD5). Provides a detailed report with refactoring suggestions to reduce technical debt.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "min_length": {
-                            "type": "integer",
-                            "description": "Minimum character length of code block to consider",
-                            "default": 100
-                        }
-                    }
-                },
-            ),
-            Tool(
-                name="silence_health_issue",
-                description="Manually silence a specific health issue (duplicate, empty body, etc.) using its unique Issue ID. Once silenced, the issue will no longer appear in Guardian notices. Use this when an issue is intentional or a false positive.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "issue_id": {
-                            "type": "string",
-                            "description": "The unique ID of the issue to silence (e.g., 'EmptyBody:func:123')"
-                        }
-                    },
-                    "required": ["issue_id"]
-                },
-            ),
-            Tool(
-                name="propose_logic",
-                description="CRITICAL: Use this tool BEFORE implementing any new helper function, utility, or business logic. It checks if similar logic already exists in the codebase to prevent duplication. Provide a description of what the code should do (intent) and optionally a draft of the code.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "intent": {
-                            "type": "string",
-                            "description": "The goal or purpose of the logic (e.g., 'format currency as USD')"
-                        },
-                        "code_draft": {
-                            "type": "string",
-                            "description": "Optional draft or pseudocode of the implementation"
-                        }
-                    },
-                    "required": ["intent"]
-                },
-            ),
-        ]
+        """Get available MCP tools via central registry."""
+        try:
+            from ..core.tool_registry import get_mcp_tools
 
-        return tools
+            # Attempt to query local server classes for their advertised tools so
+            # the registry uses server-provided metadata as the primary source.
+            servers_tools: dict = {}
+            try:
+                from ..servers.filesystem_server import FilesystemServer
+                fs = FilesystemServer(self.project_root)
+                servers_tools["filesystem"] = [
+                    {"name": t.name, "description": t.description, "inputSchema": getattr(t, "inputSchema", {})}
+                    for t in fs.advertised_tools()
+                ]
+            except Exception:
+                # If instantiation fails, skip filesystem server discovery
+                pass
+
+            try:
+                from ..servers.python_lsp_server import PythonLSPServer
+                py = PythonLSPServer(self.project_root)
+                servers_tools["python_lsp"] = [
+                    {"name": t.name, "description": t.description, "inputSchema": getattr(t, "inputSchema", {})}
+                    for t in py.advertised_tools()
+                ]
+            except Exception:
+                # Skip python lsp discovery on error
+                pass
+
+            if servers_tools:
+                return get_mcp_tools(self.project_root, servers_tools=servers_tools)
+
+            return get_mcp_tools(self.project_root)
+        except Exception:
+            # Fallback: empty list if registry unavailable
+            return []
 
     def get_capabilities(self) -> ServerCapabilities:
         """Get server capabilities."""
@@ -617,6 +351,64 @@ class MCPVectorSearchServer:
             elif request.params.name == "propose_logic":
                 return await self._handle_propose_logic(request.params.arguments)
             else:
+                # Check for language LSP proxy tools like "cpp_goto_definition"
+                import re
+
+                m = re.match(r"(?P<lang>[a-z0-9_+-]+)_(?P<action>goto_definition|find_references|get_hover_info|get_completions)", request.params.name)
+                if m:
+                    lang = m.group("lang")
+                    action = m.group("action")
+
+                    # Map action to LSP method
+                    mapping = {
+                        "goto_definition": "textDocument/definition",
+                        "find_references": "textDocument/references",
+                        "get_hover_info": "textDocument/hover",
+                        "get_completions": "textDocument/completion",
+                    }
+
+                    method = mapping.get(action)
+                    args = request.params.arguments or {}
+                    file = args.get("file")
+                    line = args.get("line")
+                    character = args.get("character")
+
+                    if not file or line is None or character is None:
+                        return CallToolResult(content=[TextContent(type="text", text="Invalid arguments for LSP tool: require file,line,character")], isError=True)
+
+                    # Build LSP params
+                    params = {
+                        "textDocument": {"uri": f"file://{file}"},
+                        "position": {"line": line, "character": character},
+                    }
+
+                    manager = get_manager(self.project_root)
+                    try:
+                        if not manager.is_available(lang):
+                            return CallToolResult(content=[TextContent(type="text", text=f"LSP server for {lang} is not running. Please run setup or ensure the language server is installed and available.")], isError=True)
+
+                        res = await manager.request(lang, method, params)
+
+                        # Convert LSP response into clean MCP TextContent blocks
+                        try:
+                            if method == "textDocument/definition":
+                                content = formatters.format_definition_response(res)
+                            elif method == "textDocument/references":
+                                content = formatters.format_references_response(res)
+                            elif method == "textDocument/hover":
+                                content = formatters.format_hover_response(res)
+                            elif method == "textDocument/completion":
+                                content = formatters.format_completions_response(res, limit=10)
+                            else:
+                                # Fallback: stringify
+                                content = [TextContent(type="text", text=json.dumps(res))]
+
+                            return CallToolResult(content=content)
+                        except Exception as fe:
+                            return CallToolResult(content=formatters.format_lsp_error(fe), isError=True)
+                    except Exception as e:
+                        return CallToolResult(content=[TextContent(type="text", text=f"LSP proxy error: {e}")], isError=True)
+
                 return CallToolResult(
                     content=[
                         TextContent(
@@ -1761,12 +1553,12 @@ class MCPVectorSearchServer:
             )
 
         analysis = await self.guardian.check_intent_duplication(intent, code_draft)
-        
+
         if not analysis["duplicate_found"]:
             return CallToolResult(
                 content=[TextContent(type="text", text="✅ No similar logic found. You can proceed with the implementation.")]
             )
-        
+
         # Format the Blocker Notice
         response_lines = [
             "### 🛑 STOP! LOGIC DUPLICATION DETECTED",
@@ -1774,7 +1566,7 @@ class MCPVectorSearchServer:
             "> **Highly similar logic already exists in your codebase.**",
             "> Implementing this again would create technical debt. Please use the existing implementation below:\n"
         ]
-        
+
         for i, match in enumerate(analysis["matches"], 1):
             func = match['function_name'] or "Global/Block"
             response_lines.append(f"#### 🔍 Match {i} (Confidence: {match['score']:.2f})")
@@ -1783,7 +1575,7 @@ class MCPVectorSearchServer:
             response_lines.append(f"- **Location:** `{match['location']}`")
             response_lines.append("\n**Existing Code Snippet:**")
             response_lines.append(f"```python\n{match['content'][:400]}...\n```\n")
-        
+
         response_lines.append("\n---")
         response_lines.append("> [!TIP]")
         response_lines.append("> Instead of writing new code, please **import and reuse** the existing logic.")

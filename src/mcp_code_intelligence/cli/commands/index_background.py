@@ -1,3 +1,137 @@
+"""Background indexing/spawn helpers extracted from index.py."""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import typer
+from loguru import logger
+
+from ..output import print_error, print_info, print_success, print_warning
+
+
+def _is_process_alive(pid: int) -> bool:
+    """Check if process with given PID is alive.
+
+    Args:
+        pid: Process ID to check
+
+    Returns:
+        True if process is alive, False otherwise
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            process_query_information = 0x0400
+            handle = kernel32.OpenProcess(process_query_information, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        else:
+            os.kill(pid, 0)
+            return True
+    except (OSError, ProcessLookupError, AttributeError):
+        return False
+
+
+def _spawn_background_indexer(
+    project_root: Path,
+    force: bool = False,
+    extensions: str | None = None,
+    workers: int | None = None,
+    throttle: float = 0.0,
+    max_size: int = 1024,
+    important_only: bool = False,
+) -> None:
+    """Spawn background indexing process.
+
+    This detaches a new Python process to run `index_background` module.
+    """
+    progress_file = project_root / ".mcp-code-intelligence" / "indexing_progress.json"
+    if progress_file.exists():
+        try:
+            with open(progress_file) as f:
+                progress = json.load(f)
+            pid = progress.get("pid")
+            if pid and _is_process_alive(pid):
+                print_warning(f"Background indexing already in progress (PID: {pid})")
+                print_info("Use 'mcp-code-intelligence index status' to check progress")
+                print_info("Use 'mcp-code-intelligence index cancel' to cancel")
+                return
+            else:
+                progress_file.unlink()
+        except Exception:
+            try:
+                progress_file.unlink()
+            except Exception:
+                logger.exception("Failed to clean stale progress file")
+
+    python_exe = sys.executable
+    cmd = [
+        python_exe,
+        "-m",
+        "mcp_code_intelligence.cli.commands.index_background",
+        "--project-root",
+        str(project_root),
+    ]
+
+    if force:
+        cmd.append("--force")
+
+    if extensions:
+        cmd.extend(["--extensions", extensions])
+
+    if workers:
+        cmd.extend(["--workers", str(workers)])
+
+    if throttle > 0:
+        cmd.extend(["--throttle", str(throttle)])
+
+    if max_size != 1024:
+        cmd.extend(["--max-size", str(max_size)])
+
+    if important_only:
+        cmd.append("--important-only")
+
+    try:
+        if sys.platform == "win32":
+            detached_process = 0x00000008
+            create_new_process_group = 0x00000200
+
+            process = subprocess.Popen(
+                cmd,
+                creationflags=detached_process | create_new_process_group,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+        else:
+            process = subprocess.Popen(
+                cmd,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+
+        pid = process.pid
+        print_success(f"Started background indexing (PID: {pid})")
+        print_info(f"Progress file: {progress_file}")
+        print_info(
+            f"Log file: {project_root / '.mcp-code-intelligence' / 'indexing_background.log'}"
+        )
+        print_info("")
+        print_info("Use [cyan]mcp-code-intelligence index status[/cyan] to check progress")
+        print_info("Use [cyan]mcp-code-intelligence index cancel[/cyan] to cancel")
+
+    except Exception as e:
+        logger.error(f"Failed to spawn background process: {e}")
+        print_error(f"Failed to start background indexing: {e}")
+        raise typer.Exit(1)
 """Background indexing entry point for detached process execution."""
 
 import argparse

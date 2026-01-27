@@ -72,7 +72,7 @@ class ProjectConfig(BaseSettings):
         description="Maximum number of worker processes for parsing (defaults to 75% of CPUs, max 8)",
     )
     throttle_delay: float = Field(
-        default=0.5,
+        default=1.0,
         ge=0.0,
         description="Delay in seconds between batches to reduce CPU load",
     )
@@ -92,6 +92,10 @@ class ProjectConfig(BaseSettings):
     enable_logic_check: bool = Field(
         default=True,
         description="Enable proactive logic duplication checking via propose_logic tool",
+    )
+    disable_server_llm: bool = Field(
+        default=False,
+        description="If True, prevent server-side LLM clients from being initialized even if API keys are present",
     )
 
     @field_validator("project_root", "index_path", mode="before")
@@ -126,7 +130,7 @@ class DatabaseConfig(BaseSettings):
         default="code_search", description="ChromaDB collection name"
     )
     batch_size: int = Field(
-        default=32, gt=0, description="Batch size for embedding operations"
+        default=4, gt=0, description="Batch size for embedding operations"
     )
     enable_telemetry: bool = Field(
         default=False, description="Enable ChromaDB telemetry"

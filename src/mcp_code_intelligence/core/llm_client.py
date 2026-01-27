@@ -10,6 +10,7 @@ import httpx
 from loguru import logger
 
 from .exceptions import SearchError
+from .context_injector import gather_context_from_search
 
 # Type alias for provider
 LLMProvider = Literal["openai", "openrouter"]
@@ -85,50 +86,53 @@ class LLMClient:
         if api_key and not self.openrouter_key:
             self.openrouter_key = api_key
 
-        # Determine which provider to use
+        # Determine which provider to use. Do NOT raise if no API keys found;
+        # instead keep the client in a disabled state so callers can still use
+        # the library for non-LLM features (search, etc.). This avoids forcing
+        # an exit when no keys are present.
+        self.enabled = True
+        self.provider: LLMProvider | None = None
         if provider:
-            # Explicit provider specified
-            self.provider: LLMProvider = provider
-            if provider == "openai" and not self.openai_key:
-                raise ValueError(
-                    "OpenAI provider specified but OPENAI_API_KEY not found. "
-                    "Please set OPENAI_API_KEY environment variable."
-                )
-            elif provider == "openrouter" and not self.openrouter_key:
-                raise ValueError(
-                    "OpenRouter provider specified but OPENROUTER_API_KEY not found. "
-                    "Please set OPENROUTER_API_KEY environment variable."
-                )
+            # Explicit provider requested
+            if provider == "openai":
+                if self.openai_key:
+                    self.provider = "openai"
+                else:
+                    logger.warning("OpenAI provider requested but OPENAI_API_KEY not found; LLM disabled.")
+                    self.enabled = False
+            elif provider == "openrouter":
+                if self.openrouter_key:
+                    self.provider = "openrouter"
+                else:
+                    logger.warning("OpenRouter provider requested but OPENROUTER_API_KEY not found; LLM disabled.")
+                    self.enabled = False
         else:
-            # Auto-detect provider (prefer OpenAI if both are available)
+            # Auto-detect provider (prefer OpenAI if available)
             if self.openai_key:
                 self.provider = "openai"
             elif self.openrouter_key:
                 self.provider = "openrouter"
             else:
-                raise ValueError(
-                    "No API key found. Please set OPENAI_API_KEY or OPENROUTER_API_KEY "
-                    "environment variable, or pass openai_api_key or openrouter_api_key parameter."
-                )
+                # No keys found — disable LLM behavior but allow instantiation
+                logger.info("No LLM API keys found; LLMClient created in disabled mode.")
+                self.enabled = False
 
-        # Set API key and endpoint based on provider
-        # Select model: explicit > env var > thinking model > default model
-        if self.provider == "openai":
+        # Set API key and endpoint based on provider (only if enabled)
+        self.api_key = None
+        self.api_endpoint = None
+        self.model = model
+        if self.enabled and self.provider == "openai":
             self.api_key = self.openai_key
             self.api_endpoint = self.API_ENDPOINTS["openai"]
             default_model = (
-                self.THINKING_MODELS["openai"]
-                if think
-                else self.DEFAULT_MODELS["openai"]
+                self.THINKING_MODELS["openai"] if think else self.DEFAULT_MODELS["openai"]
             )
             self.model = model or os.environ.get("OPENAI_MODEL", default_model)
-        else:
+        elif self.enabled and self.provider == "openrouter":
             self.api_key = self.openrouter_key
             self.api_endpoint = self.API_ENDPOINTS["openrouter"]
             default_model = (
-                self.THINKING_MODELS["openrouter"]
-                if think
-                else self.DEFAULT_MODELS["openrouter"]
+                self.THINKING_MODELS["openrouter"] if think else self.DEFAULT_MODELS["openrouter"]
             )
             self.model = model or os.environ.get("OPENROUTER_MODEL", default_model)
 
@@ -176,6 +180,11 @@ SemanticSearchEngine init threshold"""
 Generate {limit} targeted search queries:"""
 
         try:
+            # If LLM is disabled, fall back to a trivial single query
+            if not getattr(self, "enabled", True):
+                logger.debug("LLM disabled — returning fallback search query list")
+                return [natural_language_query]
+
             messages = [
                 {"role": "system", "content": system_prompt.format(limit=limit)},
                 {"role": "user", "content": user_prompt},
@@ -251,6 +260,19 @@ Search Results:
 Select the top {top_n} most relevant results:"""
 
         try:
+            # If LLM disabled, return a simple flattened ranking (best-effort)
+            if not getattr(self, "enabled", True):
+                flat = []
+                for q, results in search_results.items():
+                    for r in (results or [])[:top_n]:
+                        flat.append({"result": r, "query": q, "relevance": "Medium", "explanation": "Fallback ranking (LLM disabled)"})
+                        if len(flat) >= top_n:
+                            break
+                    if len(flat) >= top_n:
+                        break
+                logger.debug("LLM disabled — returning fallback ranked results")
+                return flat
+
             messages = [
                 {"role": "system", "content": system_prompt.format(top_n=top_n)},
                 {"role": "user", "content": user_prompt},
@@ -504,6 +526,11 @@ Return ONLY the word "find", "answer", or "analyze" with no other text."""
 
 Intent:"""
 
+        # If LLM disabled, default to 'find' intent
+        if not getattr(self, "enabled", True):
+            logger.debug("LLM disabled — defaulting intent to 'find'")
+            return "find"
+
         try:
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -669,6 +696,11 @@ Guidelines:
         # Add current query
         messages.append({"role": "user", "content": query})
 
+        # If LLM is disabled, return a helpful fallback message
+        if not getattr(self, "enabled", True):
+            logger.debug("LLM disabled — generate_answer returning fallback notice")
+            return "LLM not configured on this server. I can run semantic search and return snippets, but cannot generate a full answer without an LLM provider configured."
+
         try:
             response = await self._chat_completion(messages)
             content = (
@@ -697,6 +729,20 @@ Guidelines:
         Raises:
             SearchError: If API request fails
         """
+        # Attempt to inject contextual code snippets from a connected search engine
+        try:
+            search_engine = getattr(self, "search_engine", None)
+            if search_engine:
+                # Prefer the last user message as the focus for context
+                user_msgs = [m for m in messages if m.get("role") == "user"]
+                if user_msgs:
+                    last_user = user_msgs[-1].get("content", "")
+                    context = await gather_context_from_search(self, search_engine, last_user)
+                    if context:
+                        messages.insert(0, {"role": "system", "content": f"Relevant code snippets:\n{context}"})
+        except Exception as e:
+            logger.debug(f"Context injection skipped: {e}")
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

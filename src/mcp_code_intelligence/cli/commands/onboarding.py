@@ -1,9 +1,17 @@
 
+
+# Standard library imports
 import sys
 import shutil
 from pathlib import Path
 from typing import List, Optional
+import time
+import subprocess
+import os
+import asyncio
+import json
 
+# Third-party imports
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -11,13 +19,12 @@ from rich.table import Table
 from rich.live import Live
 from rich.layout import Layout
 from rich.text import Text
-import time
-import subprocess
-import os
-import asyncio
+
+# Internal imports (relative to cli/commands)
+from ...core.project import ProjectManager
+from ...config.defaults import get_language_from_extension
 
 # Import from py-mcp-installer library
-# Ensure this runs within the package context or after dependencies are installed
 try:
     from py_mcp_installer import (
         MCPInstaller,
@@ -27,7 +34,6 @@ try:
         PlatformInfo,
     )
 except ImportError:
-    # If running as script, might need to adjust path or env
     sys.exit("Error: py_mcp_installer not found. Run this within the installed environment.")
 
 console = Console()
@@ -65,7 +71,7 @@ def detect_platforms() -> List[PlatformInfo]:
             continue
 
 
-            
+
     return detected_platforms
 
 def install_server(platform_info: PlatformInfo, config: MCPServerConfig) -> bool:
@@ -113,7 +119,7 @@ def setup(
     # 1. Ask for languages
     languages_str = typer.prompt("Which programming languages do you use? (comma separated)", default="python")
     languages = [l.strip().lower() for l in languages_str.split(",")]
-    
+
     # 2. Optional features
     install_git = typer.confirm("Enable Git integration (requires git CLI)?", default=True)
     install_memory = typer.confirm("Enable Memory/Knowledge Graph (stores project info)?", default=True)
@@ -135,21 +141,22 @@ def setup(
         description="Semantic Search (Jina v3)"
     ))
 
-    # Python LSP
+    # Python LSP (Tekrar başlatmayı önle)
     if "python" in languages:
-        try:
-            import pylsp
-        except ImportError:
-            console.print("[dim]📦 Installing Python LSP...[/dim]")
-            subprocess.run([python_cmd, "-m", "pip", "install", "python-lsp-server"], check=True, capture_output=True)
-        
-        servers_to_install.append(MCPServerConfig(
-            name="python-lsp",
-            command=python_cmd,
-            args=["-m", "mcp_code_intelligence.servers.python_lsp_server", str(allowed_path.resolve())],
-            env={},
-            description="LSP (Type Intel)"
-        ))
+        lsp_already_added = any(s.name == "python-lsp" for s in servers_to_install)
+        if not lsp_already_added:
+            try:
+                import pylsp
+            except ImportError:
+                console.print("[dim]📦 Installing Python LSP...[/dim]")
+                subprocess.run([python_cmd, "-m", "pip", "install", "python-lsp-server"], check=True, capture_output=True)
+            servers_to_install.append(MCPServerConfig(
+                name="python-lsp",
+                command=python_cmd,
+                args=["-m", "mcp_code_intelligence.servers.python_lsp_server", str(allowed_path.resolve())],
+                env={},
+                description="LSP (Type Intel)"
+            ))
 
     # Generic Filesystem (Always recommended)
     servers_to_install.append(MCPServerConfig(
@@ -167,7 +174,7 @@ def setup(
         except ImportError:
             console.print("[dim]📦 Installing GitPython...[/dim]")
             subprocess.run([python_cmd, "-m", "pip", "install", "gitpython"], check=True, capture_output=True)
-        
+
         servers_to_install.append(MCPServerConfig(
             name="git",
             command=python_cmd,
@@ -188,16 +195,16 @@ def setup(
 
     # --- ACTION: Writing local config ---
     console.print(f"\n[bold blue]Writing Workspace Configuration...[/bold blue]")
-    local_roo_path = allowed_path / ".roo" / "mcp.json"
-    local_roo_path.parent.mkdir(parents=True, exist_ok=True)
-    
+    local_mcp_path = allowed_path / ".mcp" / "mcp.json"
+    local_mcp_path.parent.mkdir(parents=True, exist_ok=True)
+
     config_data = {"mcpServers": {}}
     for s in servers_to_install:
         config_data["mcpServers"][s.name] = {"command": s.command, "args": s.args, "env": s.env}
-    
-    with open(local_roo_path, 'w', encoding='utf-8') as f:
+
+    with open(local_mcp_path, 'w', encoding='utf-8') as f:
         json.dump(config_data, f, indent=2)
-    console.print(f"  ✅ [green]Updated .roo/mcp.json[/green]")
+    console.print(f"  ✅ [green]Updated .mcp/mcp.json[/green]")
 
     # --- ACTION: Global ---
     if global_install:
@@ -211,8 +218,8 @@ def setup(
                 console.print(f"  Configuring [cyan]{p.platform.value}[/cyan]...")
                 for s in servers:
                      install_server(p, s)
-        
-        # Roo Code Global handling
+
+        # Global AI client config handling (legacy Roo references removed)
         appdata = os.environ.get("APPDATA", "")
         if appdata:
             roo_paths = [
@@ -225,23 +232,73 @@ def setup(
                         with open(rp, 'r') as f: data = json.load(f)
                         data.setdefault("mcpServers", {}).update({s.name: {"command": s.command, "args": s.args, "env": s.env} for s in servers})
                         with open(rp, 'w') as f: json.dump(data, f, indent=2)
-                        console.print(f"  ✅ [green]Updated Roo Code Global Config[/green]")
+                        console.print(f"  ✅ [green]Updated global MCP config[/green]")
                         break
                     except Exception: continue
 
     console.print(Panel("[bold green]✨ Universal Setup Complete![/bold green]\n\n[white]Restart your AI tools to apply changes.[/white]\n[dim]To watch background activity, run:[/dim]\n[cyan]mcp-code-intelligence logs[/cyan]"))
 
 @app.command("logs")
-def view_logs():
-    """🚀 Launch the Live MCP Control Center (HUD)."""
-    log_file = Path.cwd() / ".mcp-code-intelligence" / "logs" / "activity.log"
+def view_logs(
+    project_root: Path | None = typer.Option(
+        None,
+        "--project-root",
+        "-p",
+        help="Project root directory to read logs from (defaults to nearest project)",
+        exists=False,
+        file_okay=False,
+        dir_okay=True,
+    )
+):
+    """🚀 Launch the Live MCP Control Center (HUD).
+
+    The HUD will try to locate an active project's `activity.log` by using the
+    provided `--project-root` or by searching upward from the current directory
+    for a `.mcp-code-intelligence/logs/activity.log` file that contains data.
+    If none is found, it falls back to the current working directory.
+    """
+    # Resolve project_root: prefer explicit, otherwise search upwards for a non-empty log
+    def _find_active_log(start: Path) -> Path | None:
+        # Walk up parent chain looking for .mcp-code-intelligence/logs/activity.log
+        cur = start.resolve()
+        for path in [cur] + list(cur.parents):
+            candidate = path / ".mcp-code-intelligence" / "logs" / "activity.log"
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+
+        # If not found in parents, try siblings of the start directory (common when
+        # running from a sibling project folder, e.g., running HUD from a tooling
+        # repo while the real project is in a sibling folder like ../orm-drf)
+        try:
+            parent = cur.parent
+            for sibling in parent.iterdir():
+                if not sibling.is_dir() or sibling == cur:
+                    continue
+                candidate = sibling / ".mcp-code-intelligence" / "logs" / "activity.log"
+                if candidate.exists() and candidate.stat().st_size > 0:
+                    return candidate
+        except Exception:
+            pass
+
+        return None
+
+    if project_root:
+        log_file = Path(project_root) / ".mcp-code-intelligence" / "logs" / "activity.log"
+    else:
+        found = _find_active_log(Path.cwd())
+        if found:
+            log_file = found
+        else:
+            # Fallback to current cwd path (may be empty)
+            log_file = Path.cwd() / ".mcp-code-intelligence" / "logs" / "activity.log"
+
     if not log_file.exists():
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_file.touch()
 
     layout = Layout()
+    # Only keep body in Live; header will be printed once outside Live
     layout.split(
-        Layout(name="header", size=10),
         Layout(name="body")
     )
 
@@ -254,54 +311,109 @@ def view_logs():
     ]
 
     def check_server_status():
-        table = Table(title="🛡️ MCP Code Intelligence - Live Control Center", expand=True, border_style="cyan")
+        # Render a compact status table without a large title so the
+        # header doesn't redraw big box-drawing characters repeatedly.
+        table = Table(expand=True, box=None)
         table.add_column("Server Name", style="bold white")
         table.add_column("Status", justify="center")
         table.add_column("PID", justify="right", style="dim")
         table.add_column("Active Context", style="dim")
 
-        # In a real environment, we'd check PIDs more robustly
-        # For this CLI tool, we scan process list for patterns
+        # Attempt to detect running processes with best-effort method:
+        # 1. Try psutil for reliable cmdline and pid access
+        # 2. Fallback to tasklist/ps output search
+        proc_cmdlines = []
         try:
-            if os.name == 'nt': # Windows
-                proc_list = subprocess.check_output(['tasklist', '/v', '/fo', 'csv']).decode('cp1254', errors='ignore')
-            else: # Linux/Mac
-                proc_list = subprocess.check_output(['ps', 'aux']).decode('utf-8', errors='ignore')
-        except:
-            proc_list = ""
+            import psutil
+
+            for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
+                try:
+                    cmd = " ".join(p.info.get("cmdline") or [])
+                except Exception:
+                    cmd = ""
+                proc_cmdlines.append((p.info.get("pid"), cmd))
+        except Exception:
+            try:
+                if os.name == "nt":
+                    raw = subprocess.check_output(["tasklist", "/v", "/fo", "csv"]).decode("cp1254", errors="ignore")
+                    proc_cmdlines = []
+                    for line in raw.splitlines():
+                        proc_cmdlines.append((None, line))
+                else:
+                    raw = subprocess.check_output(["ps", "aux"]).decode("utf-8", errors="ignore")
+                    proc_cmdlines = []
+                    for line in raw.splitlines():
+                        proc_cmdlines.append((None, line))
+            except Exception:
+                proc_cmdlines = []
 
         for s in servers:
-            is_running = s["pattern"] in proc_list
+            found_pid = None
+            is_running = False
+            for pid, cmd in proc_cmdlines:
+                if cmd and s["pattern"] in cmd:
+                    is_running = True
+                    if pid:
+                        found_pid = pid
+                        break
+
             status = "[bold green]● RUNNING[/bold green]" if is_running else "[bold red]○ STOPPED[/bold red]"
-            pid = "ACTIVE" if is_running else "N/A"
-            table.add_row(s["name"], status, pid, "Project Index: Ready")
-        
+            pid_display = str(found_pid) if found_pid else ("ACTIVE" if is_running else "N/A")
+            # Active context: show project root for running servers
+            active_ctx = str(Path.cwd()) if is_running else "-"
+            table.add_row(s["name"], status, pid_display, active_ctx)
+
         return table
+
+    def _sanitize(text: str) -> str:
+        # Remove common ANSI escape sequences and non-printable control chars
+        import re
+
+        # Strip ANSI color codes
+        ansi_escape = re.compile(r"\x1B\[[0-9;]*[mK]")
+        cleaned = ansi_escape.sub("", text)
+
+        # Replace other control characters except newline and tab
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", "", cleaned)
+        return cleaned
+
 
     def get_logs(limit=20):
         try:
             with open(log_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
-                return "".join(lines[-limit:])
+                raw = "".join(lines[-limit:])
+                return _sanitize(raw)
         except:
             return "Gathering log data..."
 
-    console.clear()
-    with Live(layout, refresh_per_second=2, screen=True) as live:
+    # Use the current console and full-screen Live rendering. Avoid
+    # console.clear() which can produce flicker on some terminals.
+    # Use non-fullscreen Live to avoid excessive box redraws on Windows terminals
+    # Print header once (outside Live) so it does not get re-rendered into the
+    # terminal scrollback repeatedly. Live will only manage the activity stream.
+    header_panel = Panel(
+        check_server_status(),
+        title="🛡️ MCP Code Intelligence - Live Control Center",
+        border_style="blue",
+        padding=(0, 1),
+    )
+    console.print(header_panel)
+
+    with Live(layout, refresh_per_second=2, screen=False, console=console) as live:
         try:
             while True:
-                # Update Header
-                layout["header"].update(Panel(check_server_status(), border_style="blue"))
-                
-                # Update Body
+                # Update Body each loop
                 log_data = get_logs(30)
-                layout["body"].update(Panel(
-                    Text.from_markup(log_data), 
-                    title="📝 Activity Stream", 
-                    subtitle="Press Ctrl+C to Exit",
-                    border_style="dim"
-                ))
-                
+                layout["body"].update(
+                    Panel(
+                        Text(log_data),
+                        title="📝 Activity Stream",
+                        subtitle="Press Ctrl+C to Exit",
+                        border_style="dim",
+                    )
+                )
+
                 time.sleep(0.5)
         except KeyboardInterrupt:
             pass

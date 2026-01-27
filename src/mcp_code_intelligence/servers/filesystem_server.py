@@ -13,6 +13,7 @@ from typing import Any
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+from ..core.llm_factory import wire_llm_to_server
 
 
 class FilesystemServer:
@@ -20,13 +21,19 @@ class FilesystemServer:
 
     def __init__(self, allowed_directory: Path):
         """Initialize filesystem server.
-        
+
         Args:
             allowed_directory: Root directory for file operations (security boundary)
         """
         self.allowed_directory = Path(allowed_directory).resolve()
         self.server = Server("filesystem")
         self._setup_handlers()
+
+        # Wire LLM client if config has keys
+        try:
+            wire_llm_to_server(self, project_root=self.allowed_directory)
+        except Exception:
+            pass
 
     def _is_path_allowed(self, path: Path) -> bool:
         """Check if path is within allowed directory."""
@@ -38,70 +45,73 @@ class FilesystemServer:
 
     def _setup_handlers(self):
         """Setup MCP protocol handlers."""
-
+        # register the server's advertised tools
         @self.server.list_tools()
         async def list_tools() -> list[Tool]:
-            """List available filesystem tools."""
-            return [
-                Tool(
-                    name="read_file",
-                    description="Read contents of a file",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Path to file (relative to allowed directory)"
-                            }
+            return self.advertised_tools()
+
+    def advertised_tools(self) -> list[Tool]:
+        """Return the list of Tool objects this server advertises (callable by registry)."""
+        return [
+            Tool(
+                name="read_file",
+                description="Read contents of a file (Last resort: use LSP tools first)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "relative_path": {
+                            "type": "string",
+                            "description": "Path to file (relative to allowed directory)"
+                        }
+                    },
+                    "required": ["relative_path"]
+                }
+            ),
+            Tool(
+                name="write_file",
+                description="Write content to a file",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "relative_path": {
+                            "type": "string",
+                            "description": "Path to file"
                         },
-                        "required": ["path"]
-                    }
-                ),
-                Tool(
-                    name="write_file",
-                    description="Write content to a file",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Path to file"
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "Content to write"
-                            }
-                        },
-                        "required": ["path", "content"]
-                    }
-                ),
-                Tool(
-                    name="list_directory",
-                    description="List contents of a directory",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Directory path (default: root)"
-                            }
+                        "content": {
+                            "type": "string",
+                            "description": "Content to write"
+                        }
+                    },
+                    "required": ["relative_path", "content"]
+                }
+            ),
+            Tool(
+                name="list_directory",
+                description="List contents of a directory",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "relative_path": {
+                            "type": "string",
+                            "description": "Directory path (default: root)"
                         }
                     }
-                ),
-            ]
+                }
+            ),
+        ]
 
         @self.server.call_tool()
         async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             """Handle tool calls."""
-            
+
             if name == "read_file":
-                path = self.allowed_directory / arguments["path"]
+                path = self.allowed_directory / arguments["relative_path"]
                 if not self._is_path_allowed(path):
                     return [TextContent(
                         type="text",
                         text=f"Error: Access denied - path outside allowed directory"
                     )]
-                
+
                 try:
                     content = path.read_text(encoding="utf-8")
                     return [TextContent(type="text", text=content)]
@@ -109,13 +119,13 @@ class FilesystemServer:
                     return [TextContent(type="text", text=f"Error reading file: {e}")]
 
             elif name == "write_file":
-                path = self.allowed_directory / arguments["path"]
+                path = self.allowed_directory / arguments["relative_path"]
                 if not self._is_path_allowed(path):
                     return [TextContent(
                         type="text",
                         text=f"Error: Access denied - path outside allowed directory"
                     )]
-                
+
                 try:
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(arguments["content"], encoding="utf-8")
@@ -124,20 +134,20 @@ class FilesystemServer:
                     return [TextContent(type="text", text=f"Error writing file: {e}")]
 
             elif name == "list_directory":
-                dir_path = self.allowed_directory / arguments.get("path", "")
+                dir_path = self.allowed_directory / arguments.get("relative_path", "")
                 if not self._is_path_allowed(dir_path):
                     return [TextContent(
                         type="text",
                         text=f"Error: Access denied - path outside allowed directory"
                     )]
-                
+
                 try:
                     items = []
                     for item in sorted(dir_path.iterdir()):
                         item_type = "dir" if item.is_dir() else "file"
                         size = item.stat().st_size if item.is_file() else 0
                         items.append(f"{item_type:4} {size:>10} {item.name}")
-                    
+
                     result = "\n".join(items) if items else "(empty directory)"
                     return [TextContent(type="text", text=result)]
                 except Exception as e:
@@ -160,15 +170,61 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: python -m mcp_code_intelligence.servers.filesystem_server <allowed_directory>")
         sys.exit(1)
-    
+
     allowed_dir = Path(sys.argv[1])
     if not allowed_dir.exists():
         print(f"Error: Directory does not exist: {allowed_dir}")
         sys.exit(1)
-    
+
     server = FilesystemServer(allowed_dir)
     asyncio.run(server.run())
 
 
 if __name__ == "__main__":
     main()
+
+
+def get_advertised_tools(project_root: Path) -> list[Tool]:
+    """Lightweight discovery: return the tools this module would advertise.
+
+    This function is intentionally small and does not instantiate the server.
+    """
+    return [
+        Tool(
+            name="read_file",
+            description="Read contents of a file (Last resort: use LSP tools first)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {
+                        "type": "string",
+                        "description": "Path to file (relative to allowed directory)"
+                    }
+                },
+                "required": ["relative_path"]
+            }
+        ),
+        Tool(
+            name="write_file",
+            description="Write content to a file",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {
+                        "type": "string",
+                        "description": "Path to file"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write"
+                    }
+                },
+                "required": ["relative_path", "content"]
+            }
+        ),
+        Tool(
+            name="list_directory",
+            description="List contents of a directory",
+            inputSchema={"type": "object", "properties": {"relative_path": {"type": "string", "description": "Directory path (default: root)"}}}
+        ),
+    ]

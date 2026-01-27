@@ -331,70 +331,47 @@ def _display_status(
     config_data = status_data["configuration"]
     index_data = status_data["index"]
 
-    # Project information
-    console.print("[bold blue]Project Information[/bold blue]")
-    console.print(f"  Name: {project_data['name']}")
-    console.print(f"  Root: {project_data['root_path']}")
-    console.print(
-        f"  Languages: {', '.join(project_data['languages']) if project_data['languages'] else 'None detected'}"
-    )
-    console.print(f"  Indexable Files: {project_data['file_count']}")
-    console.print()
 
-    # Configuration
-    console.print("[bold blue]Configuration[/bold blue]")
-    console.print(f"  Embedding Model: {config_data['embedding_model']}")
-    console.print(f"  Similarity Threshold: {config_data['similarity_threshold']}")
-    console.print(f"  File Extensions: {', '.join(config_data['file_extensions'])}")
-    console.print(
-        f"  Cache Embeddings: {'✓' if config_data['cache_embeddings'] else '✗'}"
-    )
-    console.print()
+    # Generate status text
+    status_text = f"""
+[bold blue]Project Information[/bold blue]
+  Name: {project_data['name']}
+  Root: {project_data['root_path']}
+  Languages: {', '.join(project_data['languages']) if project_data['languages'] else 'None detected'}
+  Indexable Files: {project_data['file_count']}
 
-    # Index statistics
-    console.print("[bold blue]Index Statistics[/bold blue]")
-    console.print(
-        f"  Indexed Files: {index_data['indexed_files']}/{index_data['total_files']}"
-    )
+[bold blue]Configuration[/bold blue]
+  Embedding Model: {config_data['embedding_model']}
+  Similarity Threshold: {config_data['similarity_threshold']}
+  File Extensions: {', '.join(config_data['file_extensions'])}
+  Cache Embeddings: {'✓' if config_data['cache_embeddings'] else '✗'}
 
-    # Handle both int and string values for total_chunks
-    total_chunks = index_data["total_chunks"]
-    if isinstance(total_chunks, str):
-        console.print(f"  Total Chunks: [yellow]{total_chunks}[/yellow]")
-    else:
-        console.print(f"  Total Chunks: {total_chunks}")
-
-    console.print(f"  Index Size: {index_data['index_size_mb']:.2f} MB")
-
-    # Version information
+[bold blue]Index Statistics[/bold blue]
+  Indexed Files: {index_data['indexed_files']}/{index_data['total_files']}
+  Total Chunks: {index_data['total_chunks']}
+  Index Size: {index_data['index_size_mb']:.2f} MB
+"""
+    # Add version and language distribution
     index_version = index_data.get("index_version")
     current_version = index_data.get("current_version", __version__)
     needs_reindex = index_data.get("needs_reindex", False)
-
     if index_version:
         if needs_reindex:
-            console.print(
-                f"  Version: [yellow]{index_version}[/yellow] (current: {current_version}) [yellow]⚠️  Reindex recommended[/yellow]"
-            )
+            status_text += f"  Version: [yellow]{index_version}[/yellow] (current: {current_version}) [yellow]⚠️  Reindex recommended[/yellow]\n"
         else:
-            console.print(f"  Version: [green]{index_version}[/green] (up to date)")
+            status_text += f"  Version: [green]{index_version}[/green] (up to date)\n"
     else:
-        console.print(
-            f"  Version: [yellow]Not tracked[/yellow] (current: {current_version}) [yellow]⚠️  Reindex recommended[/yellow]"
-        )
-
+        status_text += f"  Version: [yellow]Not tracked[/yellow] (current: {current_version}) [yellow]⚠️  Reindex recommended[/yellow]\n"
     if index_data["languages"]:
-        console.print("  Language Distribution:")
+        status_text += "  Language Distribution:\n"
         for lang, count in index_data["languages"].items():
-            console.print(f"    {lang}: {count} chunks")
-    console.print()
-
-    # Show reindex recommendation if needed
+            status_text += f"    {lang}: {count} chunks\n"
     if needs_reindex:
-        console.print(
-            "[yellow]💡 Tip: Run 'mcp-code-intelligence index' to reindex with the latest improvements[/yellow]"
-        )
-        console.print()
+        status_text += "[yellow]💡 Tip: Run 'mcp-code-intelligence index' to reindex with the latest improvements[/yellow]\n"
+
+    # Display output directly without Panel for easier copying
+    console.print(f"\n[bold cyan]📊 MCP Project Status[/bold cyan]\n{status_text}")
+
 
     # Health check results
     if "health" in status_data:

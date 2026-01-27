@@ -12,6 +12,7 @@ from typing import Any
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+from ..core.llm_factory import wire_llm_to_server
 
 try:
     import git
@@ -27,7 +28,7 @@ class GitServer:
 
     def __init__(self, repository_path: Path | None = None):
         """Initialize Git server.
-        
+
         Args:
             repository_path: Path to Git repository (default: current directory)
         """
@@ -36,11 +37,17 @@ class GitServer:
         self._repo = None
         self._setup_handlers()
 
+        # Wire LLM client if config has keys
+        try:
+            wire_llm_to_server(self, project_root=self.repo_path)
+        except Exception:
+            pass
+
     def _get_repo(self) -> Repo | None:
         """Get Git repository instance."""
         if git is None:
             return None
-        
+
         if self._repo is None:
             try:
                 self._repo = Repo(self.repo_path, search_parent_directories=True)
@@ -104,13 +111,13 @@ class GitServer:
         @self.server.call_tool()
         async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             """Handle tool calls."""
-            
+
             if git is None:
                 return [TextContent(
                     type="text",
                     text="Error: GitPython not installed. Run: pip install gitpython"
                 )]
-            
+
             repo = self._get_repo()
             if repo is None:
                 return [TextContent(
@@ -122,62 +129,62 @@ class GitServer:
                 if name == "git_status":
                     # Get status
                     status_lines = []
-                    
+
                     # Changed files
                     changed = [item.a_path for item in repo.index.diff(None)]
                     if changed:
                         status_lines.append("Modified files:")
                         status_lines.extend(f"  M {f}" for f in changed)
-                    
+
                     # Staged files
                     staged = [item.a_path for item in repo.index.diff("HEAD")]
                     if staged:
                         status_lines.append("\nStaged files:")
                         status_lines.extend(f"  A {f}" for f in staged)
-                    
+
                     # Untracked files
                     untracked = repo.untracked_files
                     if untracked:
                         status_lines.append("\nUntracked files:")
                         status_lines.extend(f"  ? {f}" for f in untracked)
-                    
+
                     result = "\n".join(status_lines) if status_lines else "Working directory clean"
                     return [TextContent(type="text", text=result)]
 
                 elif name == "git_log":
                     max_count = arguments.get("max_count", 10)
                     commits = list(repo.iter_commits(max_count=max_count))
-                    
+
                     log_lines = []
                     for commit in commits:
                         log_lines.append(f"commit {commit.hexsha[:8]}")
                         log_lines.append(f"Author: {commit.author.name} <{commit.author.email}>")
                         log_lines.append(f"Date:   {commit.committed_datetime}")
                         log_lines.append(f"\n    {commit.message.strip()}\n")
-                    
+
                     result = "\n".join(log_lines) if log_lines else "No commits"
                     return [TextContent(type="text", text=result)]
 
                 elif name == "git_diff":
                     cached = arguments.get("cached", False)
-                    
+
                     if cached:
                         # Staged changes
                         diff = repo.index.diff("HEAD", create_patch=True)
                     else:
                         # Working directory changes
                         diff = repo.index.diff(None, create_patch=True)
-                    
+
                     if not diff:
                         return [TextContent(type="text", text="No changes")]
-                    
+
                     diff_text = "\n".join(str(d) for d in diff)
                     return [TextContent(type="text", text=diff_text)]
 
                 elif name == "git_show":
                     commit_ref = arguments.get("commit", "HEAD")
                     commit = repo.commit(commit_ref)
-                    
+
                     show_lines = [
                         f"commit {commit.hexsha}",
                         f"Author: {commit.author.name} <{commit.author.email}>",
@@ -185,14 +192,14 @@ class GitServer:
                         f"\n    {commit.message.strip()}\n",
                         "\nChanges:",
                     ]
-                    
+
                     # Show changed files
                     if commit.parents:
                         diffs = commit.parents[0].diff(commit)
                         for diff in diffs:
                             change_type = diff.change_type
                             show_lines.append(f"  {change_type:6} {diff.a_path}")
-                    
+
                     result = "\n".join(show_lines)
                     return [TextContent(type="text", text=result)]
 
@@ -214,10 +221,47 @@ class GitServer:
 def main():
     """Entry point for Git server."""
     repo_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
-    
+
     server = GitServer(repo_path)
     asyncio.run(server.run())
 
 
 if __name__ == "__main__":
     main()
+
+
+def get_advertised_tools(project_root: Path) -> list[Tool]:
+    """Return lightweight advertised tools for the Git server (no instantiation)."""
+    return [
+        Tool(
+            name="git_status",
+            description="Get Git repository status",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="git_log",
+            description="Get Git commit history",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "max_count": {"type": "number", "description": "Maximum number of commits (default: 10)"}
+                }
+            }
+        ),
+        Tool(
+            name="git_diff",
+            description="Show changes in working directory",
+            inputSchema={
+                "type": "object",
+                "properties": {"cached": {"type": "boolean", "description": "Show staged changes (default: false)"}}
+            }
+        ),
+        Tool(
+            name="git_show",
+            description="Show commit details",
+            inputSchema={
+                "type": "object",
+                "properties": {"commit": {"type": "string", "description": "Commit hash or reference (default: HEAD)"}}
+            }
+        ),
+    ]

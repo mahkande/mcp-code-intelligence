@@ -8,16 +8,19 @@ from typing import Any
 
 import typer
 from loguru import logger
-from rich.live import Live
+from rich.console import Console
 from rich.markdown import Markdown
+from rich.live import Live
+from rich.syntax import Syntax
 from rich.panel import Panel
+from rich.table import Table
 
+from ...core.project import ProjectManager
+from ...core.exceptions import ProjectNotFoundError
 from ...core.database import ChromaVectorDatabase
 from ...core.embeddings import create_embedding_function
-from ...core.exceptions import ProjectNotFoundError, SearchError
-from ...core.llm_client import LLMClient
-from ...core.project import ProjectManager
 from ...core.search import SemanticSearchEngine
+from ...core.llm_client import LLMClient
 from ..didyoumean import create_enhanced_typer
 from ..output import (
     console,
@@ -26,36 +29,6 @@ from ..output import (
     print_success,
     print_warning,
 )
-
-
-def show_api_key_help() -> None:
-    """Display helpful error message when API key is missing."""
-    message = """[bold yellow]⚠️  No LLM API Key Found[/bold yellow]
-
-The chat feature requires an API key for an LLM provider.
-
-[bold cyan]Set one of these environment variables:[/bold cyan]
-  • [green]OPENAI_API_KEY[/green]       - For OpenAI (GPT-4, etc.) [dim](recommended)[/dim]
-  • [green]OPENROUTER_API_KEY[/green]  - For OpenRouter (Claude, GPT, etc.)
-
-[bold cyan]Example:[/bold cyan]
-  [yellow]export OPENAI_API_KEY="sk-..."[/yellow]
-  [yellow]export OPENROUTER_API_KEY="sk-or-..."[/yellow]
-
-[bold cyan]Get API keys at:[/bold cyan]
-  • OpenAI: [link=https://platform.openai.com/api-keys]https://platform.openai.com/api-keys[/link]
-  • OpenRouter: [link=https://openrouter.ai/keys]https://openrouter.ai/keys[/link]
-
-[dim]Alternatively, run: [cyan]mcp-code-intelligence setup[/cyan] for interactive setup[/dim]"""
-
-    panel = Panel(
-        message,
-        border_style="yellow",
-        padding=(1, 2),
-    )
-    console.print(panel)
-
-
 class ChatSession:
     """Manages conversation history with automatic compaction.
 
@@ -510,6 +483,22 @@ async def run_chat_answer(
         similarity_threshold=config.similarity_threshold,
     )
 
+    # Attach search engine to llm_client so context_injector can use it
+    try:
+        llm_client.search_engine = search_engine
+    except Exception:
+        pass
+    # Attach search engine to LLM client for context injection
+    try:
+        llm_client.search_engine = search_engine
+    except Exception:
+        pass
+    # Attach search engine to LLM client for context injection
+    try:
+        llm_client.search_engine = search_engine
+    except Exception:
+        pass
+
     # Initialize session (cleared on startup)
     system_prompt = """You are a helpful code assistant analyzing a codebase. Answer questions based on provided code context.
 
@@ -538,20 +527,34 @@ Guidelines:
     # Interactive loop
     console.print("\n[dim]Type your questions or '/exit' to quit[/dim]\n")
 
+    import sys
+    import asyncio
+    input_func = None
+    # Try to use aioconsole for async input if available
+    try:
+        import aioconsole
+        input_func = aioconsole.ainput
+    except ImportError:
+        input_func = None
+
+    async def get_input_async(prompt):
+        if input_func:
+            return await input_func(prompt)
+        else:
+            # Fallback to blocking input, but log warning
+            logger.warning("aioconsole not installed, using blocking input. Install with 'pip install aioconsole' for best experience.")
+            return input(prompt)
+
     while True:
         try:
-            # Get user input
-            user_input = console.input("\n[bold cyan]You:[/bold cyan] ").strip()
-
+            user_input = await get_input_async("\n[bold cyan]You:[/bold cyan] ")
+            user_input = user_input.strip()
+            logger.debug(f"User input: {user_input}")
             if not user_input:
                 continue
-
-            # Check for exit command
             if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
                 console.print("\n[cyan]👋 Session ended.[/cyan]")
                 break
-
-            # Process query
             await _process_answer_query(
                 query=user_input,
                 llm_client=llm_client,
@@ -563,15 +566,16 @@ Guidelines:
                 files=files,
                 config=config,
             )
-
         except KeyboardInterrupt:
+            logger.info("Session ended by KeyboardInterrupt.")
             console.print("\n\n[cyan]👋 Session ended.[/cyan]")
             break
         except EOFError:
+            logger.info("Session ended by EOFError.")
             console.print("\n\n[cyan]👋 Session ended.[/cyan]")
             break
         except Exception as e:
-            logger.error(f"Error processing query: {e}")
+            logger.error(f"Error processing query: {e}", exc_info=True)
             print_error(f"Error: {e}")
 
 
@@ -982,92 +986,62 @@ Always base your answers on actual code from the tools. If you can't find releva
     messages.append({"role": "user", "content": query})
 
     # Agentic loop
-    max_iterations = 25
+    max_iterations = 5  # Limit to 5 to avoid long blocking loops
     for _iteration in range(max_iterations):
+        logger.debug(f"Tool loop iteration {_iteration+1}/{max_iterations}")
         try:
             response = await llm_client.chat_with_tools(messages, tools)
-
+            logger.debug(f"LLM tool response: {response}")
             # Extract message from response
             choice = response.get("choices", [{}])[0]
             message = choice.get("message", {})
-
             # Check for tool calls
             tool_calls = message.get("tool_calls", [])
-
             if tool_calls:
-                # Add assistant message with tool calls
                 messages.append(message)
-
-                # Execute each tool call
                 for tool_call in tool_calls:
                     tool_id = tool_call.get("id")
                     function = tool_call.get("function", {})
                     function_name = function.get("name")
                     arguments_str = function.get("arguments", "{}")
-
-                    # Parse arguments
                     try:
                         import json
-
                         arguments = json.loads(arguments_str)
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as ex:
+                        logger.error(f"Tool argument JSON decode error: {ex}")
                         arguments = {}
-
-                    # Display tool usage
-                    console.print(
-                        f"\n[dim]🔧 Using tool: {function_name}({', '.join(f'{k}={repr(v)}' for k, v in arguments.items())})[/dim]"
-                    )
-
-                    # Execute tool
-                    if function_name == "search_code":
-                        result = await execute_search_code(
-                            arguments.get("query", ""),
-                            arguments.get("limit", 5),
-                        )
-                        console.print(
-                            f"[dim]   Found {len(result.split('[Result')) - 1} results[/dim]"
-                        )
-                    elif function_name == "read_file":
-                        result = await execute_read_file(arguments.get("file_path", ""))
-                        console.print("[dim]   Read file[/dim]")
-                    elif function_name == "list_files":
-                        result = await execute_list_files(arguments.get("pattern", ""))
-                        console.print("[dim]   Listed files[/dim]")
-                    else:
-                        result = f"Error: Unknown tool: {function_name}"
-
-                    # Add tool result to messages
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_id,
-                            "content": result,
-                        }
-                    )
-
+                    logger.info(f"Tool call: {function_name} args: {arguments}")
+                    console.print(f"\n[dim]🔧 Using tool: {function_name}({', '.join(f'{k}={repr(v)}' for k, v in arguments.items())})[/dim]")
+                    try:
+                        if function_name == "search_code":
+                            result = await execute_search_code(arguments.get("query", ""), arguments.get("limit", 5))
+                            console.print(f"[dim]   Found {len(result.split('[Result')) - 1} results[/dim]")
+                        elif function_name == "read_file":
+                            result = await execute_read_file(arguments.get("file_path", ""))
+                            console.print("[dim]   Read file[/dim]")
+                        elif function_name == "list_files":
+                            result = await execute_list_files(arguments.get("pattern", ""))
+                            console.print("[dim]   Listed files[/dim]")
+                        else:
+                            result = f"Error: Unknown tool: {function_name}"
+                    except Exception as tool_ex:
+                        logger.error(f"Tool execution error: {tool_ex}", exc_info=True)
+                        result = f"Error executing tool {function_name}: {tool_ex}"
+                    messages.append({"role": "tool", "tool_call_id": tool_id, "content": result})
             else:
-                # No tool calls - final response
                 final_content = message.get("content", "")
-
                 if not final_content:
+                    logger.error("LLM returned empty response")
                     print_error("LLM returned empty response")
                     return
-
-                # Stream the final response
                 console.print("\n[bold cyan]🤖 Assistant:[/bold cyan]\n")
-
-                # Use Rich Live for rendering
                 with Live("", console=console, auto_refresh=True) as live:
                     live.update(Markdown(final_content))
-
-                # Add to session history
                 session.add_message("user", query)
                 session.add_message("assistant", final_content)
-
                 return
-
         except Exception as e:
-            logger.error(f"Tool execution loop failed: {e}")
+            logger.error(f"Tool execution loop failed: {e}", exc_info=True)
             print_error(f"Error: {e}")
             return
 

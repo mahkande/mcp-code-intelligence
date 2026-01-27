@@ -64,18 +64,16 @@ def reset_index(
 
         # Get confirmation unless forced
         if not force:
+            console.print(f"\n[red]Index Reset Confirmation[/red]")
+            console.print("-" * 30)
             console.print(
-                Panel(
-                    "[yellow]⚠️  Warning: This will clear the entire search index![/yellow]\n\n"
-                    "The following will happen:\n"
-                    "• All indexed code chunks will be deleted\n"
-                    "• The vector database will be reset\n"
-                    "• Configuration settings will be preserved\n"
-                    f"• {'A backup will be created' if backup else 'No backup will be created'}\n\n"
-                    "You will need to run 'mcp-code-intelligence index' afterward to rebuild.",
-                    title="[red]Index Reset Confirmation[/red]",
-                    border_style="red",
-                )
+                "[yellow]⚠️  Warning: This will clear the entire search index![/yellow]\n\n"
+                "The following will happen:\n"
+                "• All indexed code chunks will be deleted\n"
+                "• The vector database will be reset\n"
+                "• Configuration settings will be preserved\n"
+                f"• {'A backup will be created' if backup else 'No backup will be created'}\n\n"
+                "You will need to run 'mcp-code-intelligence index' afterward to rebuild."
             )
 
             if not Confirm.ask("\nDo you want to proceed?", default=False):
@@ -165,16 +163,10 @@ def reset_index(
             raise typer.Exit(1)
 
         # Show next steps
-        console.print(
-            Panel(
-                "[green]✅ Index reset complete![/green]\n\n"
-                "Next steps:\n"
-                "1. Run [cyan]mcp-code-intelligence index[/cyan] to rebuild the search index\n"
-                "2. Or run [cyan]mcp-code-intelligence watch[/cyan] to start incremental indexing",
-                title="[green]Reset Complete[/green]",
-                border_style="green",
-            )
-        )
+        console.print(f"\n[green]✅ Index reset complete![/green]\n")
+        console.print("Next steps:")
+        console.print("1. Run [cyan]mcp-code-intelligence index[/cyan] to rebuild the search index")
+        console.print("2. Or run [cyan]mcp-code-intelligence watch[/cyan] to start incremental indexing")
 
     except (DatabaseError, IndexCorruptionError) as e:
         print_error(f"Reset failed: {e}")
@@ -209,18 +201,16 @@ def reset_all(
 
     # Get confirmation unless forced
     if not force:
+        console.print(f"\n[red]Complete Reset Confirmation[/red]")
+        console.print("-" * 30)
         console.print(
-            Panel(
-                "[red]⚠️  DANGER: This will remove ALL MCP Code Intelligence data![/red]\n\n"
-                "The following will be deleted:\n"
-                "• All indexed code chunks\n"
-                "• The vector database\n"
-                "• All configuration settings\n"
-                "• All project metadata\n\n"
-                "You will need to run 'mcp-code-intelligence init' to start over.",
-                title="[red]Complete Reset Confirmation[/red]",
-                border_style="red",
-            )
+            "[red]⚠️  DANGER: This will remove ALL MCP Code Intelligence data![/red]\n\n"
+            "The following will be deleted:\n"
+            "• All indexed code chunks\n"
+            "• The vector database\n"
+            "• All configuration settings\n"
+            "• All project metadata\n\n"
+            "You will need to run 'mcp-code-intelligence init' to start over."
         )
 
         if not Confirm.ask("\nAre you absolutely sure?", default=False):
@@ -244,16 +234,10 @@ def reset_all(
         shutil.rmtree(mcp_dir)
         print_success("All data removed successfully!")
 
-        console.print(
-            Panel(
-                "[green]✅ Complete reset done![/green]\n\n"
-                "To start using MCP Code Intelligence again:\n"
-                "1. Run [cyan]mcp-code-intelligence init[/cyan] to initialize the project\n"
-                "2. Run [cyan]mcp-code-intelligence index[/cyan] to index your codebase",
-                title="[green]Reset Complete[/green]",
-                border_style="green",
-            )
-        )
+        console.print(f"\n[green]✅ Complete reset done![/green]\n")
+        console.print("To start using MCP Code Intelligence again:")
+        console.print("1. Run [cyan]mcp-code-intelligence init[/cyan] to initialize the project")
+        console.print("2. Run [cyan]mcp-code-intelligence index[/cyan] to index your codebase")
     except Exception as e:
         print_error(f"Failed to remove data: {e}")
         raise typer.Exit(1)
@@ -313,29 +297,25 @@ async def check_health(
                 # Get stats for additional info
                 stats = await db.get_stats()
 
+                console.print(f"\n[green]Health Check Passed[/green]")
+                console.print("-" * 30)
                 console.print(
-                    Panel(
-                        f"[green]✅ Index is healthy![/green]\n\n"
-                        f"Statistics:\n"
-                        f"• Total chunks: {stats.total_chunks:,}\n"
-                        f"• Total files: {stats.total_files:,}\n"
-                        f"• Languages: {', '.join(stats.languages.keys()) if stats.languages else 'None'}\n"
-                        f"• Index size: {stats.index_size_mb:.2f} MB",
-                        title="[green]Health Check Passed[/green]",
-                        border_style="green",
-                    )
+                    f"[green]✅ Index is healthy![/green]\n\n"
+                    f"Statistics:\n"
+                    f"• Total chunks: {stats.total_chunks:,}\n"
+                    f"• Total files: {stats.total_files:,}\n"
+                    f"• Languages: {', '.join(stats.languages.keys()) if stats.languages else 'None'}\n"
+                    f"• Index size: {stats.index_size_mb:.2f} MB"
                 )
             else:
+                console.print(f"\n[red]Health Check Failed[/red]")
+                console.print("-" * 30)
                 console.print(
-                    Panel(
-                        "[red]❌ Index health check failed![/red]\n\n"
-                        "Detected issues:\n"
-                        "• Index may be corrupted\n"
-                        "• Database operations failing\n\n"
-                        f"{'Run with --fix to attempt automatic repair' if not fix else 'Attempting to fix...'}",
-                        title="[red]Health Check Failed[/red]",
-                        border_style="red",
-                    )
+                    "[red]❌ Index health check failed![/red]\n\n"
+                    "Detected issues:\n"
+                    "• Index may be corrupted\n"
+                    "• Database operations failing\n\n"
+                    f"{'Run with --fix to attempt automatic repair' if not fix else 'Attempting to fix...'}"
                 )
 
                 if fix:
@@ -363,16 +343,14 @@ async def check_health(
                     raise typer.Exit(1)
 
         except IndexCorruptionError as e:
+            console.print(f"\n[red]Corruption Detected[/red]")
+            console.print("-" * 30)
             console.print(
-                Panel(
-                    f"[red]❌ Index corruption detected![/red]\n\n"
-                    f"Error: {e}\n\n"
-                    "Recommended actions:\n"
-                    "1. Run [cyan]mcp-code-intelligence reset index[/cyan] to clear the corrupted index\n"
-                    "2. Run [cyan]mcp-code-intelligence index[/cyan] to rebuild",
-                    title="[red]Corruption Detected[/red]",
-                    border_style="red",
-                )
+                f"[red]❌ Index corruption detected![/red]\n\n"
+                f"Error: {e}\n\n"
+                "Recommended actions:\n"
+                "1. Run [cyan]mcp-code-intelligence reset index[/cyan] to clear the corrupted index\n"
+                "2. Run [cyan]mcp-code-intelligence index[/cyan] to rebuild"
             )
             raise typer.Exit(1)
 
@@ -390,18 +368,16 @@ async def check_health(
 def reset_main(ctx: typer.Context) -> None:
     """Reset and recovery operations for MCP Code Intelligence."""
     if ctx.invoked_subcommand is None:
+        console.print(f"\n[cyan]Reset Commands[/cyan]")
+        console.print("-" * 30)
         console.print(
-            Panel(
-                "Available reset commands:\n\n"
-                "[cyan]mcp-code-intelligence reset index[/cyan]\n"
-                "  Reset the search index (preserves config)\n\n"
-                "[cyan]mcp-code-intelligence reset health[/cyan]\n"
-                "  Check index health and optionally repair\n\n"
-                "[cyan]mcp-code-intelligence reset all[/cyan]\n"
-                "  Complete reset (removes everything)\n",
-                title="Reset Commands",
-                border_style="cyan",
-            )
+            "Available reset commands:\n\n"
+            "[cyan]mcp-code-intelligence reset index[/cyan]\n"
+            "  Reset the search index (preserves config)\n\n"
+            "[cyan]mcp-code-intelligence reset health[/cyan]\n"
+            "  Check index health and optionally repair\n\n"
+            "[cyan]mcp-code-intelligence reset all[/cyan]\n"
+            "  Complete reset (removes everything)\n"
         )
 
 

@@ -287,7 +287,9 @@ def print_search_results(
                 word_wrap=True,
             )
 
-            console.print(Panel(syntax, border_style="dim"))
+            # Print syntax directly without Panel for easier copying
+            console.print(syntax)
+
 
         console.print()  # Empty line between results
 
@@ -352,7 +354,7 @@ def print_banner() -> None:
 [bold blue]MCP Code Intelligence[/bold blue]
 [dim]CLI-first semantic code search with MCP integration[/dim]
 """
-    console.print(Panel(banner.strip(), border_style="blue"))
+    console.print(banner.strip())
 
 
 def format_file_path(file_path: Path, project_root: Path | None = None) -> str:
@@ -392,10 +394,11 @@ def print_json(data: Any, title: str | None = None) -> None:
     import json
 
     if title:
-        # Human-readable display with Rich formatting
+        # Human-readable display with Rich formatting (no Panel)
+        console.print(f"\n[bold blue]--- {title} ---[/bold blue]")
         json_str = json.dumps(data, indent=2, default=str)
         syntax = Syntax(json_str, "json", theme="monokai")
-        console.print(Panel(syntax, title=title, border_style="blue"))
+        console.print(syntax)
     else:
         # Machine-readable output: raw JSON to stdout
         # Use sys.stdout.write to bypass Rich console formatting
@@ -411,22 +414,11 @@ def print_panel(
     border_style: str = "blue",
     padding: tuple[int, int] = (1, 2),
 ) -> None:
-    """Print content in a Rich panel.
-
-    Args:
-        content: The content to display in the panel
-        title: Optional title for the panel
-        border_style: Border color/style (default: "blue")
-        padding: Tuple of (vertical, horizontal) padding
-    """
-    console.print(
-        Panel(
-            content,
-            title=title,
-            border_style=border_style,
-            padding=padding,
-        )
-    )
+    """Print content with simple formatting (no box)."""
+    if title:
+        console.print(f"\n[bold {border_style}]--- {title} ---[/bold {border_style}]")
+    console.print(content)
+    console.print()
 
 
 def print_next_steps(steps: list[str], title: str = "Next Steps") -> None:

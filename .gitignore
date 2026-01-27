@@ -1,7 +1,10 @@
 # --- MCP Code Intelligence Specific ---
 .mcp-code-intelligence/
 .mcp-vector-search/
+.mcp/
 .antigravity/
+.mcp-vector-search/
+mcp-vector-search/
 .agent/
 .roo/
 .cursor/

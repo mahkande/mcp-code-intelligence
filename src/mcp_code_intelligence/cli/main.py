@@ -30,26 +30,27 @@ def _handle_segfault(signum: int, frame) -> None:
         frame: Current stack frame (unused)
     """
     error_message = """
-╭─────────────────────────────────────────────────────────────────╮
-│ ⚠️  Segmentation Fault Detected                                  │
-├─────────────────────────────────────────────────────────────────┤
-│ This usually indicates corrupted index data or a crash in       │
-│ native libraries (ChromaDB, sentence-transformers, tree-sitter).│
-│                                                                 │
-│ To fix this, please run:                                        │
-│   1. mcp-code-intelligence reset index --force                      │
-│   2. mcp-code-intelligence index                                    │
-│                                                                 │
-│ This will rebuild your search index from scratch.               │
-│                                                                 │
-│ If the problem persists:                                        │
-│   - Try updating dependencies: pip install -U mcp-code-intelligence │
-│   - Check GitHub issues: github.com/bobmatnyc/mcp-code-intelligence │
-╰─────────────────────────────────────────────────────────────────╯
+[bold red]⚠️  Segmentation Fault Detected[/bold red]
+
+This usually indicates corrupted index data or a crash in
+native libraries (ChromaDB, sentence-transformers, tree-sitter).
+
+To fix this, please run:
+  1. mcp-code-intelligence reset index --force
+  2. mcp-code-intelligence index
+
+This will rebuild your search index from scratch.
+
+If the problem persists:
+  - Try updating dependencies: pip install -U mcp-code-intelligence
+  - Check GitHub issues: github.com/bobmatnyc/mcp-code-intelligence
 """
-    print(error_message, file=sys.stderr)
+    console.print(error_message, style="red")
     sys.exit(139)  # Standard segfault exit code (128 + 11)
 
+
+# Create console for rich output
+console = Console()
 
 # Register signal handler for segmentation faults
 signal.signal(signal.SIGSEGV, _handle_segfault)
@@ -58,11 +59,11 @@ signal.signal(signal.SIGSEGV, _handle_segfault)
 # This prints Python traceback on segfaults before signal handler runs
 faulthandler.enable()
 
-# Install rich traceback handler
-install(show_locals=True)
+# Install rich traceback handler (only in verbose mode for debugging)
+if "--verbose" in sys.argv or "-v" in sys.argv:
+    install(show_locals=True)
 
-# Create console for rich output
-console = Console()
+
 
 # Create main Typer app with "did you mean" functionality
 app = create_enhanced_typer(
@@ -128,10 +129,12 @@ from .commands.mcp import mcp_app  # noqa: E402
 from .commands.reset import reset_app  # noqa: E402
 from .commands.search import search_app, search_main  # noqa: E402, F401
 from .commands.setup import setup_app  # noqa: E402
+from .commands.health import main as health_app  # noqa: E402
 from .commands.status import main as status_main  # noqa: E402
 from .commands.uninstall import uninstall_app  # noqa: E402
 from .commands.visualize import app as visualize_app  # noqa: E402
 from .commands.onboarding import app as onboarding_app  # noqa: E402
+from .commands.onboarding import view_logs as onboarding_logs  # noqa: E402
 
 # ============================================================================
 # MAIN COMMANDS - Clean hierarchy
@@ -156,8 +159,9 @@ app.add_typer(init_app, name="init", help="🔧 Initialize project for semantic 
 # 4. DEMO - Interactive demo
 app.add_typer(demo_app, name="demo", help="🎬 Run interactive demo with sample project")
 
-# 5. DOCTOR - System health check
-# (defined below inline)
+
+# 5. HEALTH - System health and duplicate check
+app.command("health", help="🩺 Run health and duplicate checks")(health_app)
 
 # 6. STATUS - Project status
 app.command("status", help="📊 Show project status and statistics")(status_main)
@@ -202,6 +206,11 @@ app.add_typer(
 # 13. ONBOARDING - Standard MCP server setup
 app.add_typer(
     onboarding_app, name="onboarding", help="🚀 Setup standard MCP servers (filesystem, git)"
+)
+
+# Top-level alias for convenience: `mcp-code-intelligence logs`
+app.command("logs", help="📝 Live logs / HUD (alias for onboarding logs)")(
+    onboarding_logs
 )
 
 # 13. HELP - Enhanced help

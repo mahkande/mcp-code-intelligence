@@ -194,16 +194,15 @@ class SemanticIndexer:
         # Configure multiprocessing for parallel parsing
         self.use_multiprocessing = use_multiprocessing
         if use_multiprocessing:
-            # Priority: 1. Constructor param, 2. Config, 3. Default (75% CPU cap 8)
+            # Priority: 1. Constructor param, 2. Config, 3. Default (2 worker)
             if max_workers is not None:
                 self.max_workers = max_workers
             elif self.config and self.config.max_workers is not None:
                 self.max_workers = self.config.max_workers
             else:
-                cpu_count = multiprocessing.cpu_count()
-                # More conservative: 50% CPU, max 4 workers to prevent freezing
-                self.max_workers = min(max(1, int(cpu_count * 0.5)), 4)
-            
+                # Use a conservative single-worker default to limit CPU/RAM
+                # usage on desktop machines. Users can override with --workers.
+                self.max_workers = 1
             logger.debug(
                 f"Multiprocessing enabled with {self.max_workers} workers"
             )
@@ -211,12 +210,19 @@ class SemanticIndexer:
             self.max_workers = 1
             logger.debug("Multiprocessing disabled (single-threaded mode)")
 
-        # Throttling settings
-        self.throttle_delay = config.throttle_delay if config else 0.0
+        # Throttling settings (default: 2.0s)
+        if config and hasattr(config, "throttle_delay") and config.throttle_delay is not None:
+            self.throttle_delay = config.throttle_delay
+        else:
+            self.throttle_delay = 2.0
         self.max_file_size_kb = config.max_file_size_kb if config else 1024
         self.index_important_only = config.index_important_only if config else False
 
-        self.batch_size = batch_size
+        # Use batch_size from config if available, otherwise use parameter (default: 8)
+        if config and hasattr(config, "batch_size") and config.batch_size is not None:
+            self.batch_size = config.batch_size
+        else:
+            self.batch_size = 8
         self._index_metadata_file = (
             project_root / ".mcp-code-intelligence" / "index_metadata.json"
         )
@@ -416,7 +422,7 @@ class SemanticIndexer:
             return 0
 
         metadata = self._load_index_metadata()
-        
+
         # Determine which files need indexing
         if force_reindex:
             files_to_index = all_files
@@ -433,7 +439,7 @@ class SemanticIndexer:
         # --- SMART PRIORITIZATION ---
         # Reorder files to index the most important ones first
         files_to_index = self._prioritize_files(files_to_index)
-        
+
         logger.info(
             f"Indexed planned: {len(files_to_index)} files. Starting with highest priority modules."
         )
@@ -472,7 +478,7 @@ class SemanticIndexer:
                     indexed_count += 1
                 else:
                     failed_count += 1
-            
+
             # Throttling to reduce system load
             if self.throttle_delay > 0 and i + self.batch_size < len(files_to_index):
                 logger.debug(f"Throttling: sleeping for {self.throttle_delay}s...")
@@ -884,7 +890,7 @@ class SemanticIndexer:
 
         # 1. Get files currently changed in Git (Highest priority)
         git_modified = self._get_git_modified_files()
-        
+
         # 2. Common important files
         entry_points = {"main", "app", "index", "init", "run", "server"}
         documentation = {".md", ".rst", ".txt"}
@@ -897,11 +903,11 @@ class SemanticIndexer:
             # Priority 1: Currently modified (Git)
             if path in git_modified:
                 score += 1000
-            
+
             # Priority 2: Primary entry points
             if any(ep == name for ep in entry_points):
                 score += 500
-            
+
             # Priority 3: Root level importance
             depth = len(path.relative_to(self.project_root).parts)
             if depth == 1:
@@ -912,7 +918,7 @@ class SemanticIndexer:
             # Priority 4: Documentation (AI loves READMEs)
             if ext in documentation:
                 score += 300
-            
+
             return score
 
         # Sort by score (descending)
@@ -1260,14 +1266,14 @@ class SemanticIndexer:
                 # Read first 8KB to check for "minified-ness"
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     sample = f.read(8192)
-                    
+
                     # 1. Detection: Very long lines (characteristic of minified files)
                     # If any of the first few lines are > 1000 chars, it's likely minified
                     lines = sample.splitlines()
                     if any(len(line) > 1000 for line in lines[:10]):
                         logger.debug(f"Skipping likely minified file: {file_path}")
                         return False
-                    
+
                     # 2. Detection: Binary null bytes
                     if "\x00" in sample:
                         logger.debug(f"Skipping likely binary file: {file_path}")
@@ -1618,20 +1624,20 @@ class SemanticIndexer:
                     try:
                         # Only fetch hashes, not full content (saves RAM)
                         old_hash_map = await self.database.get_hashes_for_file(file_path)
-                        
+
                         filtered_chunks = []
                         current_chunk_ids = set()
-                        
+
                         for chunk in chunks:
                             current_chunk_ids.add(chunk.chunk_id)
-                            
+
                             # If chunk ID exists and hash matches, it's identical - SKIP
                             if chunk.chunk_id in old_hash_map and chunk.content_hash == old_hash_map[chunk.chunk_id]:
                                 continue
-                            
+
                             # Otherwise (New ID or Hash mismatch), we need to index it
                             filtered_chunks.append(chunk)
-                            
+
                         # Identify and delete stale chunks (exist in DB but not in current file version)
                         stale_ids = list(set(old_hash_map.keys()) - current_chunk_ids)
                         if stale_ids:
@@ -1641,7 +1647,7 @@ class SemanticIndexer:
 
                         # Update chunks list to only include new/modified ones
                         chunks = filtered_chunks
-                        
+
                     except Exception as e:
                         logger.warning(f"Granular indexing check failed for {file_path}, proceeding with full update: {e}")
 
@@ -1707,7 +1713,7 @@ class SemanticIndexer:
             for file_path in batch:
                 chunks_added, success = file_results.get(file_path, (0, False))
                 yield (file_path, chunks_added, success)
-            
+
             # Throttling to reduce system load
             if self.throttle_delay > 0 and i + self.batch_size < len(files_to_index):
                 logger.debug(f"Throttling: sleeping for {self.throttle_delay}s...")

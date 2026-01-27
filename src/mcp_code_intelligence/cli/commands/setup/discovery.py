@@ -17,34 +17,56 @@ class DiscoveryManager:
         """Detect project languages using ProjectManager."""
         return self.project_manager.detect_languages()
 
-    def scan_file_extensions(self, timeout: float = 2.0) -> list[str] | None:
-        """Scan project for unique file extensions with timeout."""
+    def scan_file_extensions(self, timeout: float = 5.0) -> list[str] | None:
+        """Scan project for unique file extensions with timeout.
+
+        Optimized to skip ignored directories (node_modules, venv, etc.)
+        to avoid timeouts on large projects.
+        """
+        import os
         extensions: set[str] = set()
         start_time = time.time()
         file_count = 0
 
+        logger.debug(f"Starting optimized file scan in {self.project_root}")
+
         try:
-            for path in self.project_root.rglob("*"):
+            for root, dirs, files in os.walk(self.project_root, topdown=True):
+                # Check timeout
                 if time.time() - start_time > timeout:
-                    logger.debug(f"File extension scan timed out after {timeout}s")
+                    logger.warning(f"File extension scan timed out after {timeout}s")
+                    if extensions:
+                        logger.info(f"Returning partial results: {len(extensions)} extensions found")
+                        return sorted(extensions)
                     return None
 
-                if not path.is_file():
-                    continue
+                # Optimization: Filter directories IN-PLACE to skip ignored ones
+                # This prevents os.walk from even entering these directories
+                dirs[:] = [
+                    d for d in dirs
+                    if not self.project_manager._should_ignore_path(Path(root) / d, is_directory=True)
+                ]
 
-                if self.project_manager._should_ignore_path(path, is_directory=False):
-                    continue
+                for file in files:
+                    file_path = Path(root) / file
+                    
+                    # Extension check
+                    ext = file_path.suffix
+                    if ext:
+                        language = get_language_from_extension(ext)
+                        if language != "text" or ext in [".txt", ".md", ".rst"]:
+                            extensions.add(ext)
+                    
+                    file_count += 1
+                    if file_count % 1000 == 0:
+                        # Periodic timeout check for very large directories of files
+                        if time.time() - start_time > timeout:
+                            break
 
-                ext = path.suffix
-                if ext:
-                    language = get_language_from_extension(ext)
-                    if language != "text" or ext in [".txt", ".md", ".rst"]:
-                        extensions.add(ext)
-                file_count += 1
-
+            logger.debug(f"Scan complete: {file_count} files searched, {len(extensions)} extensions found")
             return sorted(extensions) if extensions else None
         except Exception as e:
-            logger.debug(f"File extension scan failed: {e}")
+            logger.error(f"File extension scan failed: {e}")
             return None
 
     def detect_ai_platforms(self):
