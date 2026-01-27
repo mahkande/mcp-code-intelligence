@@ -232,11 +232,44 @@ if __name__ == "__main__":
 
 def get_advertised_tools(project_root: Path) -> list[Tool]:
     """Return lightweight advertised tools for the Git server (no instantiation)."""
+    # Normalize project_root
+    pr = Path(project_root) if project_root is not None else Path.cwd()
+
+    # 1) Dependency check: ensure GitPython is available
+    if git is None or Repo is None:
+        return [
+            Tool(
+                name="fix_git_dependency_missing",
+                description=(
+                    "Git tools are unavailable because GitPython is not installed. "
+                    "Install with: pip install GitPython"
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            )
+        ]
+
+    # 2) Repository check: ensure the provided project_root is inside a git repo
+    try:
+        # This will raise if not a repository (or if Repo isn't usable for this path)
+        Repo(pr, search_parent_directories=True)
+    except Exception:
+        return [
+            Tool(
+                name="git_init_needed",
+                description=(
+                    "Current directory is not a Git repository. Run 'git init' in the project root "
+                    "or open the repository root so Git tools become available."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            )
+        ]
+
+    # 3) If dependencies and repository are present, advertise normal git tools.
     return [
         Tool(
             name="git_status",
-            description="Get Git repository status",
-            inputSchema={"type": "object", "properties": {}}
+            description="Get Git repository status (Modified, Staged, Untracked files)",
+            inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="git_log",
@@ -246,7 +279,7 @@ def get_advertised_tools(project_root: Path) -> list[Tool]:
                 "properties": {
                     "max_count": {"type": "number", "description": "Maximum number of commits (default: 10)"}
                 }
-            }
+            },
         ),
         Tool(
             name="git_diff",
@@ -254,7 +287,7 @@ def get_advertised_tools(project_root: Path) -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {"cached": {"type": "boolean", "description": "Show staged changes (default: false)"}}
-            }
+            },
         ),
         Tool(
             name="git_show",
@@ -262,6 +295,6 @@ def get_advertised_tools(project_root: Path) -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {"commit": {"type": "string", "description": "Commit hash or reference (default: HEAD)"}}
-            }
+            },
         ),
     ]

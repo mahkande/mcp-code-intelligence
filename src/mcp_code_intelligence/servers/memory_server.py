@@ -217,6 +217,24 @@ if __name__ == "__main__":
 
 def get_advertised_tools(project_root: Path) -> list[Tool]:
     """Return lightweight advertised tools for the Memory server (no instantiation)."""
+    # Choose discovery-time storage parent: prefer project_root if provided,
+    # otherwise fall back to the user's home directory.
+    base_dir = Path(project_root) if project_root is not None else Path.home()
+
+    # If the chosen directory doesn't exist, advertise a fix tool instead of
+    # the normal memory tools so the registry can surface a remediation action.
+    if not base_dir.exists() or not base_dir.is_dir():
+        return [
+            Tool(
+                name="memory_storage_unavailable",
+                description=(
+                    "Memory storage unavailable: configured storage directory does not exist. "
+                    "Create the directory or provide a writable path."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            )
+        ]
+
     return [
         Tool(
             name="store",

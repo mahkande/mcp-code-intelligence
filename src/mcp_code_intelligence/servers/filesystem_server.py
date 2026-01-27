@@ -189,6 +189,21 @@ def get_advertised_tools(project_root: Path) -> list[Tool]:
 
     This function is intentionally small and does not instantiate the server.
     """
+    pr = Path(project_root) if project_root is not None else Path.cwd()
+
+    # If the configured allowed directory doesn't exist, advertise a fix tool.
+    if not pr.exists() or not pr.is_dir():
+        return [
+            Tool(
+                name="filesystem_path_missing",
+                description=(
+                    "Filesystem tools unavailable: configured allowed directory does not exist. "
+                    "Provide a valid directory or run the filesystem setup command."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            )
+        ]
+
     return [
         Tool(
             name="read_file",

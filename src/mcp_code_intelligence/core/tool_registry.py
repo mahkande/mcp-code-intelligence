@@ -224,6 +224,26 @@ def get_mcp_tools(project_root: Optional[Path] = None, servers_tools: Optional[d
     """
     tools: List[Tool] = []
 
+    # Load project-level config from .mcp/mcp.json if available so server
+    # discovery functions can consult centralized settings (e.g. which
+    # directories to index, which python path LSPs should use, etc.). If the
+    # file is malformed, advertise a remediation tool but continue discovery.
+    project_cfg: Optional[dict] = None
+    if project_root:
+        try:
+            cfg_path = Path(project_root) / ".mcp" / "mcp.json"
+            if cfg_path.exists():
+                project_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            # Add a remediation tool so users get actionable guidance
+            err_name = "fix_mcp_config_malformed"
+            err_desc = (
+                "Project config .mcp/mcp.json exists but could not be parsed. "
+                f"Error: {e}. Inspect the JSON file for syntax errors."
+            )
+            if not any(x.name == err_name for x in tools):
+                tools.append(Tool(name=err_name, description=err_desc, inputSchema={"type": "object", "properties": {}}))
+
     # Add base tools
     for td in _TOOL_DEFINITIONS:
         # normalize any internal file path keys to `relative_path` for consistency
@@ -244,11 +264,22 @@ def get_mcp_tools(project_root: Optional[Path] = None, servers_tools: Optional[d
                         try:
                             mod = importlib.import_module(mod_name)
                             if hasattr(mod, "get_advertised_tools"):
+                                # Prefer calling discovery with both project_root and
+                                # the parsed project config if the function accepts it.
                                 try:
-                                    adv = mod.get_advertised_tools(project_root or Path.cwd())
-                                except Exception as e:
-                                    # If server discovery itself failed, advertise an unavailable notice
-                                    adv = [Tool(name=f"{f.stem}_unavailable", description=f"Server discovery failed: {e}", inputSchema={})]
+                                    from inspect import signature
+
+                                    sig = signature(mod.get_advertised_tools)
+                                    if len(sig.parameters) >= 2:
+                                        adv = mod.get_advertised_tools(project_root or Path.cwd(), project_cfg)
+                                    else:
+                                        adv = mod.get_advertised_tools(project_root or Path.cwd())
+                                except Exception:
+                                    # fallback to single-arg call
+                                    try:
+                                        adv = mod.get_advertised_tools(project_root or Path.cwd())
+                                    except Exception as e:
+                                        adv = [Tool(name=f"{f.stem}_unavailable", description=f"Server discovery failed: {e}", inputSchema={})]
                                 servers_tools[f.stem] = adv
                         except Exception as e:
                             # If importing the server module fails during discovery, record
