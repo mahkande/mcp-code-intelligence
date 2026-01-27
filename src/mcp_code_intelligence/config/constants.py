@@ -22,4 +22,9 @@ HIGH_SIMILARITY_THRESHOLD = 0.75  # Higher threshold for more precise matches
 
 # Cache Constants
 DEFAULT_CACHE_SIZE = 256  # Default LRU cache size for file reads
+# Default reranker model (optional). If set to a Jina model id, the engine
+# will attempt to use Jina's reranker path when available, otherwise it will
+# safely fall back to the HF `transformers` cross-encoder or heuristic reranking.
+# Set to None to disable automatic neural reranker by default.
+DEFAULT_RERANKER_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
 

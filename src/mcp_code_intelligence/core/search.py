@@ -104,7 +104,10 @@ class SemanticSearchEngine:
         self.similarity_threshold = similarity_threshold
         self.auto_indexer = auto_indexer
         self.enable_auto_reindex = enable_auto_reindex
-        self.reranker_model_name = reranker_model_name
+        # Allow default model from project constants if not explicitly provided
+        from ..config.constants import DEFAULT_RERANKER_MODEL
+
+        self.reranker_model_name = reranker_model_name or DEFAULT_RERANKER_MODEL
         self._reranker_model = None
         self._reranker_tokenizer = None
 
@@ -125,10 +128,10 @@ class SemanticSearchEngine:
 
         # Boilerplate filter for smart result ranking
         self._boilerplate_filter = BoilerplateFilter()
-        
+
         # RAG Guards for quality and security
         self.rag_guard = RAGGuard()
-        
+
         # Git Manager for recency boosting
         try:
             self.git_manager = GitManager(project_root)
@@ -333,7 +336,7 @@ class SemanticSearchEngine:
             if similarity_threshold is not None
             else self._get_adaptive_threshold(query)
         )
-        
+
         # Update active files for RAG Guard (Recency Guard)
         if self.git_manager:
             try:
@@ -369,23 +372,23 @@ class SemanticSearchEngine:
                     total_file_lines = 0
                     delivered_lines = 0
                     unique_files = set()
-                    
+
                     for r in ranked_results:
                         unique_files.add(r.file_path)
                         delivered_lines += (r.end_line - r.start_line + 1)
-                    
+
                     # Estimate total lines in files (using cache hits)
                     for f_path in unique_files:
                         if f_path in self._file_cache:
                             total_file_lines += len(self._file_cache[f_path])
                         else:
                             # Fallback if not in cache (rare after enhance_result)
-                            total_file_lines += delivered_lines * 5 
+                            total_file_lines += delivered_lines * 5
 
                     savings = 0
                     if total_file_lines > 0:
                         savings = int((1 - (delivered_lines / total_file_lines)) * 100)
-                    
+
                     logger.info(f"[VERİMLİLİK] 📉 AI Bağlamı Optimize Edildi: {total_file_lines} satır → {delivered_lines} satır (%{savings} Token tasarrufu).")
                     logger.info(f"[ZEKA] 🎯 Jina v3 Filtresi: {len(unique_files)} dosya tarandı, en alakalı {len(ranked_results)} kod parçası seçildi.")
                 except Exception:
@@ -472,6 +475,17 @@ class SemanticSearchEngine:
         # Convert to SearchResult
         results = []
         for i, chunk in enumerate(chunks):
+            # Determine symbol context
+            ct = chunk.chunk_type or "code"
+            if ct in ("function", "method"):
+                sym_ctx = "function"
+            elif ct == "class":
+                sym_ctx = "class"
+            else:
+                sym_ctx = "global"
+
+            nav_hint = f"{chunk.file_path}:{chunk.start_line}"
+
             results.append(
                 SearchResult(
                     content=chunk.content,
@@ -481,10 +495,17 @@ class SemanticSearchEngine:
                     language=chunk.language,
                     similarity_score=1.0,  # Exact matches get perfect score
                     rank=i + 1,
-                    chunk_type=chunk.chunk_type,
+                    chunk_type=ct,
                     function_name=chunk.function_name,
                     class_name=chunk.class_name,
                     quality_score=100,
+                    symbol_context=sym_ctx,
+                    navigation_hint=nav_hint,
+                    suggested_next_action=(
+                        {"tool": "find_references", "input": {"relative_path": str(chunk.file_path), "line": int(chunk.start_line), "character": 1}, "message": f"Bu sembolün referanslarını görmek için 'find_references' aracını kullanabilirsin (örn. {chunk.file_path}:{chunk.start_line})."}
+                        if sym_ctx in ("function", "class")
+                        else {"tool": "get_hover_info", "input": {"relative_path": str(chunk.file_path), "line": int(chunk.start_line), "character": 1}, "message": f"Daha fazla bilgi için 'get_hover_info' aracıyla bu konumu inceleyebilirsin (örn. {chunk.file_path}:{chunk.start_line})."}
+                    ),
                 )
             )
 
@@ -830,10 +851,10 @@ class SemanticSearchEngine:
 
         # Apply RAG Guard penalties (TODO, Deprecated, Secrets)
         results = self.rag_guard.apply_search_penalties(results, query)
-        
+
         # Apply Framework/Language Scope filtering
         results = self.rag_guard.filter_scope(results, query)
-        
+
         # Diversity check (Context Size Guard): Max 3 chunks per file
         file_counts = {}
         diverse_results = []
@@ -843,10 +864,10 @@ class SemanticSearchEngine:
             if count < 3:
                 diverse_results.append(r)
                 file_counts[file_path] = count + 1
-        
+
         # Final sort since guards might have changed scores
         diverse_results.sort(key=lambda r: r.similarity_score, reverse=True)
-        
+
         # Final rank update
         for i, result in enumerate(diverse_results):
             result.rank = i + 1
@@ -855,57 +876,131 @@ class SemanticSearchEngine:
 
     def _neural_rerank(self, results: list[SearchResult], query: str) -> list[SearchResult]:
         """Apply neural reranking using cross-encoder model.
-        
+
         This provides much higher accuracy by considering query-document interaction.
         """
-        if not results or not HAS_TRANSFORMERS:
+        if not results:
             return results
 
+        # If reranker_model_name appears to reference a Jina reranker and Jina is available,
+        # attempt to use Jina's reranking path. Any failure falls back to transformers or
+        # heuristic reranking without raising.
         try:
-            # Lazy load reranker
-            if self._reranker_model is None:
-                logger.info(f"Loading neural reranker: {self.reranker_model_name}...")
-                self._reranker_tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name, trust_remote_code=True)
-                self._reranker_model = AutoModelForSequenceClassification.from_pretrained(
-                    self.reranker_model_name, trust_remote_code=True
-                )
-                self._reranker_model.eval()
-                # Move to GPU if available
-                if torch.cuda.is_available():
-                    self._reranker_model.to("cuda")
+            use_jina = False
+            if self.reranker_model_name and "jina" in str(self.reranker_model_name).lower():
+                try:
+                    import jina  # type: ignore
 
-            # Prepare pairs (query, chunk_content)
-            pairs = [[query, r.content] for r in results[:50]]  # Rerank top 50
-            if not pairs:
-                return results
+                    use_jina = True
+                except Exception:
+                    use_jina = False
 
-            with torch.no_grad():
-                inputs = self._reranker_tokenizer(
-                    pairs, padding=True, truncation=True, return_tensors="pt", max_length=512
-                )
-                # Move inputs to same device as model
-                if hasattr(self._reranker_model, "device"):
-                    inputs = {k: v.to(self._reranker_model.device) for k, v in inputs.items()}
-                
-                outputs = self._reranker_model(**inputs)
-                scores = outputs.logits.view(-1).float()
-                # Apply sigmoid if it's a single logit per pair (common for cross-encoders)
-                if scores.dim() == 1:
-                    scores = torch.sigmoid(scores)
-                
-                # Update scores in results
-                for i, score in enumerate(scores.tolist()):
-                    # Combine original similarity with reranker score
-                    # 0.3 weight for vector similarity, 0.7 for reranker
-                    results[i].similarity_score = (0.3 * results[i].similarity_score) + (0.7 * score)
-            
-            # Re-sort after reranking
-            results.sort(key=lambda r: r.similarity_score, reverse=True)
-            logger.debug(f"Neural reranking completed for {len(pairs)} results")
+            if use_jina:
+                try:
+                    # Lazy attempt to use Jina client for reranking. This is best-effort
+                    # and will be silently fallbacked on any error.
+                    from jina import Document, Client  # type: ignore
 
-        except Exception as e:
-            logger.warning(f"Neural reranking failed: {e}")
-            
+                    # Build Documents: one input Document per candidate with query in .text
+                    docs = []
+                    for r in results[:50]:
+                        d = Document(text=query)
+                        # attach candidate as a match so many Jina rerankers accept query+matches
+                        m = Document(text=r.content)
+                        d.matches.append(m)
+                        docs.append(d)
+
+                    client = Client()
+                    # Attempt to call a rerank endpoint; use root '/' with on='/rerank' as a convention
+                    responses = client.post(
+                        on='/rerank', inputs=docs, parameters={'model': self.reranker_model_name}, return_results=True
+                    )
+
+                    # Parse responses: responses is a list of response objects containing matches with scores
+                    # We'll take the first batch of matches and map scores back to results by order
+                    if responses:
+                        # responses may wrap batches; flatten
+                        flat_scores = []
+                        for resp in responses:
+                            for doc in resp.docs:
+                                for match in doc.matches:
+                                    # try common score fields
+                                    s = None
+                                    try:
+                                        s = match.scores.get('cosine').value  # type: ignore
+                                    except Exception:
+                                        try:
+                                            s = match.scores.get('default').value  # type: ignore
+                                        except Exception:
+                                            s = getattr(match, 'score', None)
+                                    flat_scores.append(float(s) if s is not None else 0.0)
+
+                        # Apply scores to results in order (best-effort mapping)
+                        for i, sc in enumerate(flat_scores[: len(results[:50])]):
+                            results[i].similarity_score = max(results[i].similarity_score, sc)
+
+                        # Re-sort after applying Jina scores
+                        results.sort(key=lambda r: r.similarity_score, reverse=True)
+                        logger.debug("Jina reranking applied")
+                        return results
+
+                except Exception as e:
+                    logger.warning(f"Jina reranking attempt failed, falling back: {e}")
+
+        except Exception:
+            # Conservative: never let jak/pyjni issues crash search
+            pass
+
+        # Fallback: transformers-based cross-encoder if available
+        if HAS_TRANSFORMERS:
+            try:
+                # Lazy load reranker
+                if self._reranker_model is None:
+                    logger.info(f"Loading neural reranker: {self.reranker_model_name}...")
+                    self._reranker_tokenizer = AutoTokenizer.from_pretrained(
+                        self.reranker_model_name, trust_remote_code=True
+                    )
+                    self._reranker_model = AutoModelForSequenceClassification.from_pretrained(
+                        self.reranker_model_name, trust_remote_code=True
+                    )
+                    self._reranker_model.eval()
+                    # Move to GPU if available
+                    if torch.cuda.is_available():
+                        self._reranker_model.to("cuda")
+
+                # Prepare pairs (query, chunk_content)
+                pairs = [[query, r.content] for r in results[:50]]  # Rerank top 50
+                if not pairs:
+                    return results
+
+                with torch.no_grad():
+                    inputs = self._reranker_tokenizer(
+                        pairs, padding=True, truncation=True, return_tensors="pt", max_length=512
+                    )
+                    # Move inputs to same device as model
+                    if hasattr(self._reranker_model, "device"):
+                        inputs = {k: v.to(self._reranker_model.device) for k, v in inputs.items()}
+
+                    outputs = self._reranker_model(**inputs)
+                    scores = outputs.logits.view(-1).float()
+                    # Apply sigmoid if it's a single logit per pair (common for cross-encoders)
+                    if scores.dim() == 1:
+                        scores = torch.sigmoid(scores)
+
+                    # Update scores in results
+                    for i, score in enumerate(scores.tolist()):
+                        # Combine original similarity with reranker score
+                        # 0.3 weight for vector similarity, 0.7 for reranker
+                        results[i].similarity_score = (0.3 * results[i].similarity_score) + (0.7 * score)
+
+                # Re-sort after reranking
+                results.sort(key=lambda r: r.similarity_score, reverse=True)
+                logger.debug(f"Neural reranking completed for {len(pairs)} results")
+
+            except Exception as e:
+                logger.warning(f"Neural reranking failed: {e}")
+
+        # If transformers not available or reranking failed, return heuristic-sorted results
         return results
 
     def analyze_query(self, query: str) -> dict[str, Any]:
