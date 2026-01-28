@@ -80,15 +80,27 @@ def get_advertised_tools(project_root: Path) -> List[Tool]:
         ),
         Tool(
             name="query_vectors",
-            description="Query the vector database for nearest neighbors",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "number"}
-                },
-                "required": ["query"]
-            }
+                description="Query the vector database for nearest neighbors",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query text"},
+                        "top_k": {"type": "number", "description": "Max results to return (alias for limit)"},
+                        "limit": {"type": "number", "description": "Max results to return (alias for top_k)"},
+                        "filters": {
+                            "type": "object",
+                            "description": "Metadata filters (e.g. {\"file_path\": [\"*.py\"], \"function_name\": [\"init\"]})"
+                        },
+                        "similarity_threshold": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Minimum similarity (0.0-1.0) to include results"
+                        },
+                        "include_context": {"type": "boolean", "description": "Whether to include surrounding context lines (pre/post)"}
+                    },
+                    "required": ["query"]
+                }
         ),
         Tool(
             name="delete_index",

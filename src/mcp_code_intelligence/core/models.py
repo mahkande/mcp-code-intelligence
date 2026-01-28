@@ -57,10 +57,10 @@ class CodeChunk:
         if self.type_annotations is None:
             self.type_annotations = {}
 
-        # Calculate content hash if not provided (SHA256 of full content)
+        # Calculate content hash if not provided (MD5 of full content)
         if self.content_hash is None:
             import hashlib
-            self.content_hash = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+            self.content_hash = hashlib.md5(self.content.encode("utf-8")).hexdigest()
 
         # Generate chunk ID if not provided
         if self.chunk_id is None:
@@ -187,6 +187,24 @@ class SearchResult(BaseModel):
     quality_score: int | None = Field(
         default=None, description="Overall quality score (0-100)"
     )
+    # New metadata fields for agent navigation and context
+    symbol_context: str | None = Field(
+        default="global",
+        description="Symbol context: 'class', 'function' or 'global'",
+    )
+    navigation_hint: str | None = Field(
+        default=None,
+        description="Editor navigation hint in format file_path:line_number",
+    )
+    # Structured suggestion to guide Agent for next LSP action
+    suggested_next_action: dict | None = Field(
+        default=None,
+        description="Structured suggested next action for Agent, e.g. {'tool': 'find_references', 'input': {...}, 'message': '...'}",
+    )
+    # Content hash of the indexed chunk (MD5) to detect stale indexes
+    content_hash: str | None = Field(
+        default=None, description="MD5 content hash of the indexed chunk"
+    )
 
     class Config:
         arbitrary_types_allowed = True
@@ -257,6 +275,9 @@ class SearchResult(BaseModel):
             "highlights": self.highlights,
             "location": self.location,
             "line_count": self.line_count,
+            "symbol_context": self.symbol_context,
+            "navigation_hint": self.navigation_hint,
+            "suggested_next_action": self.suggested_next_action,
         }
 
         # Add quality metrics if available

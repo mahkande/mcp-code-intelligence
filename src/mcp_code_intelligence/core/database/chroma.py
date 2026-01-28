@@ -385,17 +385,70 @@ class ChromaVectorDatabase(VectorDatabase, DatabaseRecoveryMixin):
 
                             quality_score = max(0, score)
 
+                        # Determine symbol context and editor navigation hint
+                        chunk_type_val = metadata.get("chunk_type", "code")
+                        if chunk_type_val in ("function", "method"):
+                            symbol_ctx = "function"
+                        elif chunk_type_val == "class":
+                            symbol_ctx = "class"
+                        else:
+                            symbol_ctx = "global"
+
+                        navigation_hint_val = f"{metadata.get('file_path')}:{metadata.get('start_line')}"
+
+                        # Build suggested next action linking to LSP tools
+                        suggested_action = None
+                        file_for_tool = metadata.get("file_path")
+                        line_for_tool = metadata.get("start_line")
+                        func_name = metadata.get("function_name")
+                        cls_name = metadata.get("class_name")
+
+                        if symbol_ctx == "function" and func_name:
+                            suggested_action = {
+                                "tool": "find_references",
+                                "input": {
+                                    "relative_path": str(file_for_tool),
+                                    "line": int(line_for_tool),
+                                    "character": 1,
+                                },
+                                "message": f"Bu fonksiyonun referanslarını görmek için 'find_references' aracını kullanabilirsin (örn. {file_for_tool}:{line_for_tool}).",
+                            }
+                        elif symbol_ctx == "class" and cls_name:
+                            suggested_action = {
+                                "tool": "find_references",
+                                "input": {
+                                    "relative_path": str(file_for_tool),
+                                    "line": int(line_for_tool),
+                                    "character": 1,
+                                },
+                                "message": f"Bu sınıfın referanslarını görmek için 'find_references' aracını kullanabilirsin (örn. {file_for_tool}:{line_for_tool}).",
+                            }
+                        else:
+                            suggested_action = {
+                                "tool": "get_hover_info",
+                                "input": {
+                                    "relative_path": str(file_for_tool),
+                                    "line": int(line_for_tool),
+                                    "character": 1,
+                                },
+                                "message": f"Daha fazla bilgi için 'get_hover_info' aracıyla bu konumu inceleyebilirsin (örn. {file_for_tool}:{line_for_tool}).",
+                            }
+
                         result = SearchResult(
                             content=doc,
                             file_path=Path(metadata["file_path"]),
                             start_line=metadata["start_line"],
                             end_line=metadata["end_line"],
                             language=metadata["language"],
+                            content_hash=metadata.get("content_hash"),
                             similarity_score=similarity,
                             rank=i + 1,
-                            chunk_type=metadata.get("chunk_type", "code"),
+                            chunk_type=chunk_type_val,
                             function_name=metadata.get("function_name") or None,
                             class_name=metadata.get("class_name") or None,
+                            suggested_next_action=suggested_action,
+                            symbol_context=symbol_ctx,
+                            navigation_hint=navigation_hint_val,
                             # Quality metrics from structural analysis
                             cognitive_complexity=metadata.get("cognitive_complexity"),
                             cyclomatic_complexity=metadata.get("cyclomatic_complexity"),
@@ -483,7 +536,7 @@ class ChromaVectorDatabase(VectorDatabase, DatabaseRecoveryMixin):
                     # If content_hash is missing (legacy chunk), use empty string
                     # This ensures it's captured in old_hash_map and will be updated/deleted
                     hashes[chunk_id] = metadata.get("content_hash", "")
-            
+
             return hashes
 
         except Exception as e:
@@ -658,6 +711,29 @@ class ChromaVectorDatabase(VectorDatabase, DatabaseRecoveryMixin):
             return chunks
         except Exception as e:
             logger.error(f"Symbol lookup failed for {symbol_name}: {e}")
+            return []
+
+    async def get_chunks_by_hash(self, content_hash: str) -> list[CodeChunk]:
+        """Return chunks that match the provided content_hash."""
+        if not self._collection:
+            raise DatabaseNotInitializedError("Database not initialized")
+
+        try:
+            results = self._collection.get(
+                where={"content_hash": content_hash}, include=["metadatas", "documents"]
+            )
+
+            chunks: list[CodeChunk] = []
+            if results and results.get("ids"):
+                for i, _ in enumerate(results["ids"]):
+                    metadata = results["metadatas"][i]
+                    content = results["documents"][i]
+                    chunks.append(self._metadata_to_chunk(metadata, content))
+
+            return chunks
+
+        except Exception as e:
+            logger.error(f"Failed to lookup chunks by hash {content_hash}: {e}")
             return []
 
     def _metadata_to_chunk(self, metadata: dict, content: str) -> CodeChunk:

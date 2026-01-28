@@ -21,7 +21,7 @@ from .chroma import ChromaVectorDatabase
 
 class PooledChromaVectorDatabase(ChromaVectorDatabase):
     """ChromaDB implementation with connection pooling for improved performance.
-    
+
     Inherits from ChromaVectorDatabase to reuse helper methods like _metadata_to_chunk,
     but overrides main methods to use the connection pool.
     """
@@ -183,6 +183,41 @@ class PooledChromaVectorDatabase(ChromaVectorDatabase):
 
                         if similarity >= similarity_threshold:
                             # Document contains the original content (no metadata appended)
+                            chunk_type_val = metadata.get("chunk_type", "code")
+                            if chunk_type_val in ("function", "method"):
+                                symbol_ctx = "function"
+                            elif chunk_type_val == "class":
+                                symbol_ctx = "class"
+                            else:
+                                symbol_ctx = "global"
+
+                            navigation_hint_val = f"{metadata.get('file_path')}:{metadata.get('start_line')}"
+                            # Build suggested next action linking to LSP tools
+                            suggested_action = None
+                            file_for_tool = metadata.get("file_path")
+                            line_for_tool = metadata.get("start_line")
+                            func_name = metadata.get("function_name")
+                            cls_name = metadata.get("class_name")
+
+                            if symbol_ctx == "function" and func_name:
+                                suggested_action = {
+                                    "tool": "find_references",
+                                    "input": {"relative_path": str(file_for_tool), "line": int(line_for_tool), "character": 1},
+                                    "message": f"Bu fonksiyonun referanslarını görmek için 'find_references' aracını kullanabilirsin (örn. {file_for_tool}:{line_for_tool}).",
+                                }
+                            elif symbol_ctx == "class" and cls_name:
+                                suggested_action = {
+                                    "tool": "find_references",
+                                    "input": {"relative_path": str(file_for_tool), "line": int(line_for_tool), "character": 1},
+                                    "message": f"Bu sınıfın referanslarını görmek için 'find_references' aracını kullanabilirsin (örn. {file_for_tool}:{line_for_tool}).",
+                                }
+                            else:
+                                suggested_action = {
+                                    "tool": "get_hover_info",
+                                    "input": {"relative_path": str(file_for_tool), "line": int(line_for_tool), "character": 1},
+                                    "message": f"Daha fazla bilgi için 'get_hover_info' aracıyla bu konumu inceleyebilirsin (örn. {file_for_tool}:{line_for_tool}).",
+                                }
+
                             result = SearchResult(
                                 content=doc,
                                 file_path=Path(metadata["file_path"]),
@@ -191,9 +226,12 @@ class PooledChromaVectorDatabase(ChromaVectorDatabase):
                                 language=metadata["language"],
                                 similarity_score=similarity,
                                 rank=i + 1,
-                                chunk_type=metadata.get("chunk_type", "code"),
+                                chunk_type=chunk_type_val,
                                 function_name=metadata.get("function_name") or None,
                                 class_name=metadata.get("class_name") or None,
+                                symbol_context=symbol_ctx,
+                                navigation_hint=navigation_hint_val,
+                                suggested_next_action=suggested_action,
                             )
                             search_results.append(result)
 

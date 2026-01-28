@@ -11,6 +11,9 @@ import aiofiles
 from loguru import logger
 
 from ..config.constants import DEFAULT_CACHE_SIZE
+from .interfaces import QueryProcessor, RerankerService, ResilienceManager
+from .services.reranker import get_global_reranker
+from .services.resilience import SimpleResilienceManager, ServiceUnavailableError
 from .auto_indexer import AutoIndexer, SearchTriggeredIndexer
 from .boilerplate import BoilerplateFilter
 from .database import VectorDatabase
@@ -88,6 +91,9 @@ class SemanticSearchEngine:
         auto_indexer: AutoIndexer | None = None,
         enable_auto_reindex: bool = True,
         reranker_model_name: str | None = None,
+        resilience_manager: ResilienceManager | None = None,
+        reranker_service: RerankerService | None = None,
+        query_processor: QueryProcessor | None = None,
     ) -> None:
         """Initialize semantic search engine.
 
@@ -137,6 +143,26 @@ class SemanticSearchEngine:
             self.git_manager = GitManager(project_root)
         except Exception:
             self.git_manager = None
+
+        # Dependency-injected services (with sensible defaults)
+        # Lazy defaults: SimpleResilienceManager and global reranker
+        self.resilience_manager: ResilienceManager = (
+            resilience_manager or SimpleResilienceManager()
+        )
+        # If a concrete reranker service provided, respect it; otherwise use global singleton
+        self.reranker_service: RerankerService = (
+            reranker_service or get_global_reranker(self.reranker_model_name)
+        )
+
+        # Default QueryProcessor that delegates to existing _preprocess_query
+        if query_processor is not None:
+            self.query_processor = query_processor
+        else:
+            class _DefaultQP:
+                async def process(inner_self, q: str) -> str:
+                    return self._preprocess_query(q)
+
+            self.query_processor: QueryProcessor = _DefaultQP()
 
     @staticmethod
     def _is_rust_panic_error(error: Exception) -> bool:
@@ -189,101 +215,7 @@ class SemanticSearchEngine:
 
         return any(indicator in error_msg for indicator in corruption_indicators)
 
-    async def _search_with_retry(
-        self,
-        query: str,
-        limit: int,
-        filters: dict[str, Any] | None,
-        threshold: float,
-        max_retries: int = 3,
-    ) -> list[SearchResult]:
-        """Execute search with retry logic and exponential backoff.
-
-        Args:
-            query: Processed search query
-            limit: Maximum number of results
-            filters: Optional filters
-            threshold: Similarity threshold
-            max_retries: Maximum retry attempts (default: 3)
-
-        Returns:
-            List of search results
-
-        Raises:
-            RustPanicError: If Rust panic persists after retries
-            SearchError: If search fails for other reasons
-        """
-        last_error = None
-        backoff_delays = [0, 0.1, 0.5]  # Immediate, 100ms, 500ms
-
-        for attempt in range(max_retries):
-            try:
-                # Add delay for retries (exponential backoff)
-                if attempt > 0 and backoff_delays[attempt] > 0:
-                    await asyncio.sleep(backoff_delays[attempt])
-                    logger.debug(
-                        f"Retrying search after {backoff_delays[attempt]}s delay (attempt {attempt + 1}/{max_retries})"
-                    )
-
-                # Perform the actual search
-                results = await self.database.search(
-                    query=query,
-                    limit=limit,
-                    filters=filters,
-                    similarity_threshold=threshold,
-                )
-
-                # Success! If we had retries, log that we recovered
-                if attempt > 0:
-                    logger.info(
-                        f"Search succeeded after {attempt + 1} attempts (recovered from transient error)"
-                    )
-
-                return results
-
-            except BaseException as e:
-                # Re-raise system exceptions we should never catch
-                if isinstance(e, KeyboardInterrupt | SystemExit | GeneratorExit):
-                    raise
-
-                last_error = e
-
-                # Check if this is a Rust panic
-                if self._is_rust_panic_error(e):
-                    logger.warning(
-                        f"ChromaDB Rust panic detected (attempt {attempt + 1}/{max_retries}): {e}"
-                    )
-
-                    # If this is the last retry, escalate to corruption recovery
-                    if attempt == max_retries - 1:
-                        logger.error(
-                            "Rust panic persisted after all retries - index may be corrupted"
-                        )
-                        raise RustPanicError(
-                            "ChromaDB Rust panic detected. The HNSW index may be corrupted. "
-                            "Please run 'mcp-code-intelligence reset' followed by 'mcp-code-intelligence index' to rebuild."
-                        ) from e
-
-                    # Otherwise, continue to next retry
-                    continue
-
-                # Check for general corruption
-                elif self._is_corruption_error(e):
-                    logger.error(f"Index corruption detected: {e}")
-                    raise SearchError(
-                        "Index corruption detected. Please run 'mcp-code-intelligence reset' "
-                        "followed by 'mcp-code-intelligence index' to rebuild."
-                    ) from e
-
-                # Some other error - don't retry, just fail
-                else:
-                    logger.error(f"Search failed: {e}")
-                    raise SearchError(f"Search failed: {e}") from e
-
-        # Should never reach here, but just in case
-        raise SearchError(
-            f"Search failed after {max_retries} retries: {last_error}"
-        ) from last_error
+    # NOTE: retry/resilience logic has been moved to `ResilienceManager` implementations.
 
     async def search(
         self,
@@ -346,43 +278,81 @@ class SemanticSearchEngine:
                 pass
 
         try:
-            # Preprocess query
-            processed_query = self._preprocess_query(query)
+            # Preprocess query via QueryProcessor
+            processed_query = await self.query_processor.process(query)
 
-            # Perform vector search with retry logic
-            results = await self._search_with_retry(
-                query=processed_query,
-                limit=limit,
-                filters=filters,
-                threshold=threshold,
-            )
+            # Perform vector search wrapped by resilience manager
+            async def _db_search():
+                return await self.database.search(
+                    query=processed_query,
+                    limit=limit,
+                    filters=filters,
+                    similarity_threshold=threshold,
+                )
 
-            # Post-process results
+            try:
+                results = await self.resilience_manager.execute(_db_search, max_retries=3, jitter=0.2)
+            except ServiceUnavailableError as sue:
+                logger.error(f"Resilience manager rejected request: {sue}")
+                return []
+
+            # Post-process results (context enrichment)
             enhanced_results = []
             for result in results:
                 enhanced_result = await self._enhance_result(result, include_context)
                 enhanced_results.append(enhanced_result)
 
-            # Apply additional ranking if needed
-            ranked_results = self._rerank_results(enhanced_results, query)
+            # Rerank via injected reranker service
+            try:
+                ranked_results = await self.reranker_service.rerank(enhanced_results, query)
+            except Exception as e:
+                logger.warning(f"Reranker service failed, falling back to unranked results: {e}")
+                ranked_results = enhanced_results
+
+            # Simple Git-based recency boosting
+            if self.git_manager:
+                try:
+                    recent = set(str(f) for f in self.git_manager.get_changed_files())
+                    for r in ranked_results:
+                        if str(r.file_path) in recent:
+                            r.similarity_score = min(1.0, r.similarity_score + self._BOOST_SOURCE_FILE)
+                except Exception:
+                    pass
+
+            # Apply RAG Guard penalties and scope filtering
+            ranked_results = self.rag_guard.apply_search_penalties(ranked_results, query)
+            ranked_results = self.rag_guard.filter_scope(ranked_results, query)
+
+            # Diversity: limit 3 chunks per file
+            file_counts = {}
+            diverse_results = []
+            for r in ranked_results:
+                file_path = str(r.file_path)
+                count = file_counts.get(file_path, 0)
+                if count < 3:
+                    diverse_results.append(r)
+                    file_counts[file_path] = count + 1
+
+            # Final sort and rank update
+            diverse_results.sort(key=lambda r: r.similarity_score, reverse=True)
+            for i, result in enumerate(diverse_results):
+                result.rank = i + 1
 
             # Efficiency Pipeline Logging
-            if ranked_results:
+            if diverse_results:
                 try:
                     total_file_lines = 0
                     delivered_lines = 0
                     unique_files = set()
 
-                    for r in ranked_results:
+                    for r in diverse_results:
                         unique_files.add(r.file_path)
                         delivered_lines += (r.end_line - r.start_line + 1)
 
-                    # Estimate total lines in files (using cache hits)
                     for f_path in unique_files:
                         if f_path in self._file_cache:
                             total_file_lines += len(self._file_cache[f_path])
                         else:
-                            # Fallback if not in cache (rare after enhance_result)
                             total_file_lines += delivered_lines * 5
 
                     savings = 0
@@ -390,22 +360,23 @@ class SemanticSearchEngine:
                         savings = int((1 - (delivered_lines / total_file_lines)) * 100)
 
                     logger.info(f"[VERİMLİLİK] 📉 AI Bağlamı Optimize Edildi: {total_file_lines} satır → {delivered_lines} satır (%{savings} Token tasarrufu).")
-                    logger.info(f"[ZEKA] 🎯 Jina v3 Filtresi: {len(unique_files)} dosya tarandı, en alakalı {len(ranked_results)} kod parçası seçildi.")
+                    logger.info(f"[ZEKA] 🎯 Reranker applied: {len(unique_files)} dosya tarandı, en alakalı {len(diverse_results)} kod parçası seçildi.")
                 except Exception:
                     pass
 
             logger.debug(
-                f"Search for '{query}' with threshold {threshold:.3f} returned {len(ranked_results)} results"
+                f"Search for '{query}' with threshold {threshold:.3f} returned {len(diverse_results)} results"
             )
-            return ranked_results
+
+            return diverse_results
 
         except (RustPanicError, SearchError):
             # These errors are already properly formatted with user guidance
             raise
         except Exception as e:
-            # Unexpected error - wrap it in SearchError
+            # Unexpected error - log and return safe fallback
             logger.error(f"Unexpected search error for query '{query}': {e}")
-            raise SearchError(f"Search failed: {e}") from e
+            return []
 
     async def search_similar(
         self,
@@ -727,6 +698,23 @@ class SemanticSearchEngine:
             result.context_before = context_before
             result.context_after = context_after
 
+            # Detect stale index by verifying content_hash exists in DB for this location
+            try:
+                if result.content_hash and hasattr(self.database, "get_chunks_by_hash"):
+                    matches = await self.database.get_chunks_by_hash(result.content_hash)
+                    # Check whether any match corresponds to the same location
+                    location_match = any(
+                        (str(m.file_path) == str(result.file_path) and m.start_line == result.start_line and m.end_line == result.end_line)
+                        for m in matches
+                    )
+                    if not location_match:
+                        logger.warning(
+                            f"Stale index detected for {result.file_path}:{result.start_line}-{result.end_line} (content_hash mismatch)"
+                        )
+            except Exception:
+                # Don't fail enhancement if the DB check fails
+                pass
+
         except FileNotFoundError:
             # File was deleted since indexing - silently skip context
             # This is normal when index is stale; use --force to reindex
@@ -737,271 +725,9 @@ class SemanticSearchEngine:
 
         return result
 
-    def _rerank_results(
-        self, results: list[SearchResult], query: str
-    ) -> list[SearchResult]:
-        """Apply advanced ranking to search results using multiple factors.
-
-        Args:
-            results: Original search results
-            query: Original search query
-
-        Returns:
-            Reranked search results
-        """
-        if not results:
-            return results
-
-        # Pre-compute lowercased strings once (avoid repeated .lower() calls)
-        query_lower = query.lower()
-        query_words = set(query_lower.split())
-
-        # Pre-compute file extensions for source files
-        source_exts = frozenset(
-            [".py", ".js", ".ts", ".java", ".cpp", ".c", ".go", ".rs"]
-        )
-
-        for result in results:
-            # Start with base similarity score
-            score = result.similarity_score
-
-            # Factor 1: Exact matches in identifiers (high boost)
-            if result.function_name:
-                func_name_lower = result.function_name.lower()
-                if query_lower in func_name_lower:
-                    score += self._BOOST_EXACT_IDENTIFIER
-                # Partial word matches
-                score += sum(
-                    self._BOOST_PARTIAL_IDENTIFIER
-                    for word in query_words
-                    if word in func_name_lower
-                )
-
-            if result.class_name:
-                class_name_lower = result.class_name.lower()
-                if query_lower in class_name_lower:
-                    score += self._BOOST_EXACT_IDENTIFIER
-                # Partial word matches
-                score += sum(
-                    self._BOOST_PARTIAL_IDENTIFIER
-                    for word in query_words
-                    if word in class_name_lower
-                )
-
-            # Factor 2: File name relevance
-            file_name_lower = result.file_path.name.lower()
-            if query_lower in file_name_lower:
-                score += self._BOOST_FILE_NAME_EXACT
-            score += sum(
-                self._BOOST_FILE_NAME_PARTIAL
-                for word in query_words
-                if word in file_name_lower
-            )
-
-            # Factor 3: Content density (how many query words appear)
-            content_lower = result.content.lower()
-            word_matches = sum(1 for word in query_words if word in content_lower)
-            if word_matches > 0:
-                score += (word_matches / len(query_words)) * 0.1
-
-            # Factor 4: Code structure preferences (combined conditions)
-            if result.chunk_type == "function":
-                score += self._BOOST_FUNCTION_CHUNK
-            elif result.chunk_type == "class":
-                score += self._BOOST_CLASS_CHUNK
-
-            # Factor 5: File type preferences (prefer source files over tests)
-            file_ext = result.file_path.suffix.lower()
-            if file_ext in source_exts:
-                score += self._BOOST_SOURCE_FILE
-            if "test" in file_name_lower:  # Already computed
-                score += self._PENALTY_TEST_FILE
-
-            # Factor 6: Path depth preference
-            path_depth = len(result.file_path.parts)
-            if path_depth <= 3:
-                score += self._BOOST_SHALLOW_PATH
-            elif path_depth > 5:
-                score += self._PENALTY_DEEP_PATH
-
-            # Factor 7: Boilerplate penalty (penalize common boilerplate patterns)
-            # Apply penalty to function names (constructors, lifecycle methods, etc.)
-            if result.function_name:
-                boilerplate_penalty = self._boilerplate_filter.get_penalty(
-                    name=result.function_name,
-                    language=result.language,
-                    query=query,
-                    penalty=self._PENALTY_BOILERPLATE,
-                )
-                score += boilerplate_penalty
-
-            # Ensure score doesn't exceed 1.0
-            result.similarity_score = min(1.0, score)
-
-        # Sort by enhanced similarity score
-        results.sort(key=lambda r: r.similarity_score, reverse=True)
-
-        # Update ranks
-        for i, result in enumerate(results):
-            result.rank = i + 1
-
-        # Apply Neural Reranking if enabled
-        if self.reranker_model_name:
-            results = self._neural_rerank(results, query)
-
-        # Apply RAG Guard penalties (TODO, Deprecated, Secrets)
-        results = self.rag_guard.apply_search_penalties(results, query)
-
-        # Apply Framework/Language Scope filtering
-        results = self.rag_guard.filter_scope(results, query)
-
-        # Diversity check (Context Size Guard): Max 3 chunks per file
-        file_counts = {}
-        diverse_results = []
-        for r in results:
-            file_path = str(r.file_path)
-            count = file_counts.get(file_path, 0)
-            if count < 3:
-                diverse_results.append(r)
-                file_counts[file_path] = count + 1
-
-        # Final sort since guards might have changed scores
-        diverse_results.sort(key=lambda r: r.similarity_score, reverse=True)
-
-        # Final rank update
-        for i, result in enumerate(diverse_results):
-            result.rank = i + 1
-
-        return diverse_results
-
-    def _neural_rerank(self, results: list[SearchResult], query: str) -> list[SearchResult]:
-        """Apply neural reranking using cross-encoder model.
-
-        This provides much higher accuracy by considering query-document interaction.
-        """
-        if not results:
-            return results
-
-        # If reranker_model_name appears to reference a Jina reranker and Jina is available,
-        # attempt to use Jina's reranking path. Any failure falls back to transformers or
-        # heuristic reranking without raising.
-        try:
-            use_jina = False
-            if self.reranker_model_name and "jina" in str(self.reranker_model_name).lower():
-                try:
-                    import jina  # type: ignore
-
-                    use_jina = True
-                except Exception:
-                    use_jina = False
-
-            if use_jina:
-                try:
-                    # Lazy attempt to use Jina client for reranking. This is best-effort
-                    # and will be silently fallbacked on any error.
-                    from jina import Document, Client  # type: ignore
-
-                    # Build Documents: one input Document per candidate with query in .text
-                    docs = []
-                    for r in results[:50]:
-                        d = Document(text=query)
-                        # attach candidate as a match so many Jina rerankers accept query+matches
-                        m = Document(text=r.content)
-                        d.matches.append(m)
-                        docs.append(d)
-
-                    client = Client()
-                    # Attempt to call a rerank endpoint; use root '/' with on='/rerank' as a convention
-                    responses = client.post(
-                        on='/rerank', inputs=docs, parameters={'model': self.reranker_model_name}, return_results=True
-                    )
-
-                    # Parse responses: responses is a list of response objects containing matches with scores
-                    # We'll take the first batch of matches and map scores back to results by order
-                    if responses:
-                        # responses may wrap batches; flatten
-                        flat_scores = []
-                        for resp in responses:
-                            for doc in resp.docs:
-                                for match in doc.matches:
-                                    # try common score fields
-                                    s = None
-                                    try:
-                                        s = match.scores.get('cosine').value  # type: ignore
-                                    except Exception:
-                                        try:
-                                            s = match.scores.get('default').value  # type: ignore
-                                        except Exception:
-                                            s = getattr(match, 'score', None)
-                                    flat_scores.append(float(s) if s is not None else 0.0)
-
-                        # Apply scores to results in order (best-effort mapping)
-                        for i, sc in enumerate(flat_scores[: len(results[:50])]):
-                            results[i].similarity_score = max(results[i].similarity_score, sc)
-
-                        # Re-sort after applying Jina scores
-                        results.sort(key=lambda r: r.similarity_score, reverse=True)
-                        logger.debug("Jina reranking applied")
-                        return results
-
-                except Exception as e:
-                    logger.warning(f"Jina reranking attempt failed, falling back: {e}")
-
-        except Exception:
-            # Conservative: never let jak/pyjni issues crash search
-            pass
-
-        # Fallback: transformers-based cross-encoder if available
-        if HAS_TRANSFORMERS:
-            try:
-                # Lazy load reranker
-                if self._reranker_model is None:
-                    logger.info(f"Loading neural reranker: {self.reranker_model_name}...")
-                    self._reranker_tokenizer = AutoTokenizer.from_pretrained(
-                        self.reranker_model_name, trust_remote_code=True
-                    )
-                    self._reranker_model = AutoModelForSequenceClassification.from_pretrained(
-                        self.reranker_model_name, trust_remote_code=True
-                    )
-                    self._reranker_model.eval()
-                    # Move to GPU if available
-                    if torch.cuda.is_available():
-                        self._reranker_model.to("cuda")
-
-                # Prepare pairs (query, chunk_content)
-                pairs = [[query, r.content] for r in results[:50]]  # Rerank top 50
-                if not pairs:
-                    return results
-
-                with torch.no_grad():
-                    inputs = self._reranker_tokenizer(
-                        pairs, padding=True, truncation=True, return_tensors="pt", max_length=512
-                    )
-                    # Move inputs to same device as model
-                    if hasattr(self._reranker_model, "device"):
-                        inputs = {k: v.to(self._reranker_model.device) for k, v in inputs.items()}
-
-                    outputs = self._reranker_model(**inputs)
-                    scores = outputs.logits.view(-1).float()
-                    # Apply sigmoid if it's a single logit per pair (common for cross-encoders)
-                    if scores.dim() == 1:
-                        scores = torch.sigmoid(scores)
-
-                    # Update scores in results
-                    for i, score in enumerate(scores.tolist()):
-                        # Combine original similarity with reranker score
-                        # 0.3 weight for vector similarity, 0.7 for reranker
-                        results[i].similarity_score = (0.3 * results[i].similarity_score) + (0.7 * score)
-
-                # Re-sort after reranking
-                results.sort(key=lambda r: r.similarity_score, reverse=True)
-                logger.debug(f"Neural reranking completed for {len(pairs)} results")
-
-            except Exception as e:
-                logger.warning(f"Neural reranking failed: {e}")
-
-        # If transformers not available or reranking failed, return heuristic-sorted results
-        return results
+    # NOTE: reranking and advanced heuristic ranking have been delegated to
+    # `RerankerService` implementations. The legacy local reranking logic was
+    # intentionally removed in favor of service-based, testable components.
 
     def analyze_query(self, query: str) -> dict[str, Any]:
         """Analyze search query and provide suggestions for improvement.

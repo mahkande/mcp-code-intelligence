@@ -89,12 +89,12 @@ class VectorDatabase(ABC):
     @abstractmethod
     async def get_hashes_for_file(self, file_path: Path) -> dict[str, str]:
         """Get only chunk IDs and their content hashes for a file.
-        
+
         Optimized for incremental indexing to avoid loading full content.
-        
+
         Args:
             file_path: Path to the file
-            
+
         Returns:
             Dictionary mapping chunk_id -> content_hash
         """
@@ -147,6 +147,18 @@ class VectorDatabase(ABC):
 
         Returns:
             List of matching code chunks
+        """
+        ...
+
+    @abstractmethod
+    async def get_chunks_by_hash(self, content_hash: str) -> list[CodeChunk]:
+        """Get chunks matching a content hash.
+
+        Args:
+            content_hash: MD5 content hash to lookup
+
+        Returns:
+            List of CodeChunk instances that match the content hash
         """
         ...
 

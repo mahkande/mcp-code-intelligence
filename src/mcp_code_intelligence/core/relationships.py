@@ -34,11 +34,11 @@ console = Console()
 
 def extract_function_calls(code: str, language: str = "python") -> set[str]:
     """Extract actual function calls from code.
-    
+
     Uses AST for Python for high precision, and regex fallback for other languages (Dart, JS, etc.).
     """
     calls = set()
-    
+
     # 1. Python specific AST analysis
     if language.lower() == "python":
         try:
@@ -57,16 +57,16 @@ def extract_function_calls(code: str, language: str = "python") -> set[str]:
     # Matches patterns like funcName(), obj.methodName(), but avoids keywords
     # Excludes common control flow keywords
     keywords = {'if', 'for', 'while', 'switch', 'catch', 'return', 'yield', 'await', 'async'}
-    
-    # Pattern explanation: 
-    # [a-zA-Z_]\w* : Identifier 
+
+    # Pattern explanation:
+    # [a-zA-Z_]\w* : Identifier
     # (?=\s*\()    : Lookahead for opening parenthesis (means it's a call)
     matches = re.findall(r'\b([a-zA-Z_]\w*)\s*(?=\()', code)
-    
+
     for match in matches:
         if match not in keywords:
             calls.add(match)
-            
+
     return calls
 
 
@@ -212,9 +212,60 @@ class RelationshipStore:
             f"Computing semantic relationships for {len(code_chunks)} chunks "
             f"(max {max_concurrent_queries} concurrent queries)..."
         )
-        semantic_links = await self._compute_semantic_relationships(
-            code_chunks, database, max_concurrent_queries
-        )
+
+        # Load existing relationships if present so we can skip recomputation
+        existing_relationships = {}
+        if self.store_path.exists():
+            try:
+                with open(self.store_path) as f:
+                    existing = json.load(f)
+                    for link in existing.get("semantic", []):
+                        src = link.get("source")
+                        if src:
+                            existing_relationships.setdefault(src, []).append(link)
+            except Exception:
+                existing_relationships = {}
+
+        # Group chunks by file to fetch stored hashes efficiently
+        from collections import defaultdict
+
+        file_to_chunks: dict[str, list[CodeChunk]] = defaultdict(list)
+        for c in code_chunks:
+            file_to_chunks[str(c.file_path)].append(c)
+
+        # Determine which chunks actually changed by comparing DB hashes
+        chunks_to_compute: list[CodeChunk] = []
+        reused_links: list[dict[str, Any]] = []
+
+        for file_path, chunks_in_file in file_to_chunks.items():
+            try:
+                db_hash_map = await database.get_hashes_for_file(Path(file_path))
+            except Exception:
+                db_hash_map = {}
+
+            for c in chunks_in_file:
+                chunk_id = c.chunk_id or c.id
+                db_hash = db_hash_map.get(chunk_id, "")
+
+                # If hashes match, reuse existing semantic links for this chunk
+                if db_hash and c.content_hash and db_hash == c.content_hash:
+                    links = existing_relationships.get(chunk_id, [])
+                    if links:
+                        reused_links.extend(links)
+                        continue
+
+                # Otherwise mark for recomputation
+                chunks_to_compute.append(c)
+
+        # Compute semantic links only for changed chunks
+        semantic_links_new = []
+        if chunks_to_compute:
+            semantic_links_new = await self._compute_semantic_relationships(
+                chunks_to_compute, database, max_concurrent_queries
+            )
+
+        # Merge reused links and newly computed links
+        semantic_links = reused_links + semantic_links_new
 
         elapsed = time.time() - start_time
 

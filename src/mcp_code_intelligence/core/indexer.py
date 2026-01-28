@@ -153,6 +153,8 @@ class SemanticIndexer:
         debug: bool = False,
         collectors: list[MetricCollector] | None = None,
         use_multiprocessing: bool = True,
+        embedding_batch_size: int | None = None,
+        onnx_num_threads: int | None = None,
     ) -> None:
         """Initialize semantic indexer.
 
@@ -223,6 +225,12 @@ class SemanticIndexer:
             self.batch_size = config.batch_size
         else:
             self.batch_size = 8
+        # Embedding insertion batching (controls how many chunks to send to DB at once)
+        # If None, we send the whole batch to the database which may perform internal batching.
+        self.embedding_batch_size = embedding_batch_size or 256
+
+        # Optional ONNX / CPU thread limits applied during embedding generation
+        self.onnx_num_threads = onnx_num_threads
         self._index_metadata_file = (
             project_root / ".mcp-code-intelligence" / "index_metadata.json"
         )
@@ -1082,8 +1090,8 @@ class SemanticIndexer:
                     logger.warning(f"Failed to collect metrics for {file_path}: {e}")
                     chunk_metrics = None
 
-            # Add chunks to database with metrics
-            await self.database.add_chunks(chunks_with_hierarchy, metrics=chunk_metrics)
+            # Add chunks to database with metrics (apply batching and thread limits)
+            await self._add_chunks_with_limits(chunks_with_hierarchy, metrics=chunk_metrics)
 
             # Update metadata after successful indexing
             metadata = self._load_index_metadata()
@@ -1846,5 +1854,88 @@ class SemanticIndexer:
                 f.write(f"{separator}\n")
         except Exception as e:
             logger.debug(f"Failed to write indexing run header: {e}")
+
+    def _apply_onnx_thread_limits(self) -> dict:
+        """Apply environment / runtime thread limits for ONNX/BLAS during embedding generation.
+
+        Returns a dict of previous values to restore later.
+        """
+        prev = {}
+        try:
+            # Common environment variables controlling CPU threads
+            for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                prev[var] = os.environ.get(var)
+                if self.onnx_num_threads is not None:
+                    os.environ[var] = str(self.onnx_num_threads)
+
+            # If onnxruntime is available, try to set its thread limits programmatically
+            try:
+                import onnxruntime as ort
+
+                if self.onnx_num_threads is not None and hasattr(ort, "set_default_logging_severity"):
+                    # Newer ort versions may expose set_num_threads or set_global_thread_options
+                    try:
+                        if hasattr(ort, "set_num_threads"):
+                            ort.set_num_threads(self.onnx_num_threads)
+                    except Exception:
+                        # Best-effort; continue
+                        pass
+            except Exception:
+                # onnxruntime not available or failed to set - ignore
+                pass
+
+        except Exception:
+            # Be defensive - don't let thread-limiting break indexing
+            prev = {}
+
+        return prev
+
+    def _restore_onnx_thread_limits(self, prev: dict) -> None:
+        """Restore previously saved environment variables after embedding generation."""
+        try:
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+    async def _add_chunks_with_limits(self, chunks: list["CodeChunk"], metrics: dict | None = None) -> None:
+        """Add chunks to the database in sub-batches while applying ONNX/CPU limits.
+
+        This prevents sending extremely large embedding requests to the embedding
+        backend and temporarily restricts CPU thread usage for onnx/runtime.
+        """
+        if not chunks:
+            return
+
+        # Apply thread limits
+        prev_env = self._apply_onnx_thread_limits()
+
+        try:
+            # If embedding_batch_size is None or large, just send in one call
+            batch_size = self.embedding_batch_size or len(chunks)
+            if batch_size >= len(chunks):
+                await self.database.add_chunks(chunks, metrics=metrics)
+                return
+
+            # Otherwise split into sub-batches and call sequentially
+            start = 0
+            while start < len(chunks):
+                end = start + batch_size
+                sub_chunks = chunks[start:end]
+
+                # Build sub-metrics mapping for this sub-batch
+                sub_metrics = None
+                if metrics:
+                    sub_metrics = {k: v for k, v in metrics.items() if any(c.chunk_id == k for c in sub_chunks)}
+
+                await self.database.add_chunks(sub_chunks, metrics=sub_metrics)
+                start = end
+
+        finally:
+            # Restore environment
+            self._restore_onnx_thread_limits(prev_env)
 
 
