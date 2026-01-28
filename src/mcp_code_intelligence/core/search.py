@@ -1,87 +1,37 @@
-"""Semantic search engine for MCP Code Intelligence."""
+"""Lightweight SemanticSearchEngine delegating responsibilities to services.
 
-import asyncio
-import re
+This module keeps the orchestration pipeline small and delegates
+query processing, context enrichment, scoring and resilience to service
+implementations under `core.services`.
+"""
+
+from __future__ import annotations
+
 import time
-from collections import OrderedDict
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
-import aiofiles
 from loguru import logger
 
-from ..config.constants import DEFAULT_CACHE_SIZE
-from .interfaces import QueryProcessor, RerankerService, ResilienceManager
-from .services.reranker import get_global_reranker
-from .services.resilience import SimpleResilienceManager, ServiceUnavailableError
-from .auto_indexer import AutoIndexer, SearchTriggeredIndexer
-from .boilerplate import BoilerplateFilter
 from .database import VectorDatabase
 from .exceptions import RustPanicError, SearchError
 from .git import GitManager
 from .guards import RAGGuard
 from .models import SearchResult
 
-try:
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-    import torch
-    HAS_TRANSFORMERS = True
-except ImportError:
-    HAS_TRANSFORMERS = False
+from .services.resilience import SimpleResilienceManager, ServiceUnavailableError
+from .services.reranker import get_global_reranker
+from .services.context import DefaultContextService
+from .interfaces import ContextService
+from .services.query_processor import DefaultQueryProcessor, QueryProcessorService
+from .services.scoring import ScoringService
+from .services.discovery import DiscoveryService
+from .auto_indexer import AutoIndexer, SearchTriggeredIndexer
 
 
 class SemanticSearchEngine:
-    """Semantic search engine for code search."""
-
-    # Query expansion constants (class-level for performance)
-    _QUERY_EXPANSIONS = {
-        # Common abbreviations
-        "auth": "authentication authorize login",
-        "db": "database data storage",
-        "api": "application programming interface endpoint",
-        "ui": "user interface frontend view",
-        "util": "utility helper function",
-        "config": "configuration settings options",
-        "async": "asynchronous await promise",
-        "sync": "synchronous blocking",
-        "func": "function method",
-        "var": "variable",
-        "param": "parameter argument",
-        "init": "initialize setup create",
-        "parse": "parsing parser analyze",
-        "validate": "validation check verify",
-        "handle": "handler process manage",
-        "error": "exception failure bug",
-        "test": "testing unittest spec",
-        "mock": "mocking stub fake",
-        "log": "logging logger debug",
-        # Programming concepts
-        "class": "class object type",
-        "method": "method function procedure",
-        "property": "property attribute field",
-        "import": "import require include",
-        "export": "export module public",
-        "return": "return yield output",
-        "loop": "loop iterate for while",
-        "condition": "condition if else branch",
-        "array": "array list collection",
-        "string": "string text character",
-        "number": "number integer float",
-        "boolean": "boolean true false",
-    }
-
-    # Reranking boost constants (class-level for performance)
-    _BOOST_EXACT_IDENTIFIER = 0.15
-    _BOOST_PARTIAL_IDENTIFIER = 0.05
-    _BOOST_FILE_NAME_EXACT = 0.08
-    _BOOST_FILE_NAME_PARTIAL = 0.03
-    _BOOST_FUNCTION_CHUNK = 0.05
-    _BOOST_CLASS_CHUNK = 0.03
-    _BOOST_SOURCE_FILE = 0.02
-    _BOOST_SHALLOW_PATH = 0.02
-    _PENALTY_TEST_FILE = -0.02
-    _PENALTY_DEEP_PATH = -0.01
-    _PENALTY_BOILERPLATE = -0.15
+    """Orchestrates an async semantic search pipeline using small services."""
 
     def __init__(
         self,
@@ -89,80 +39,41 @@ class SemanticSearchEngine:
         project_root: Path,
         similarity_threshold: float = 0.3,
         auto_indexer: AutoIndexer | None = None,
-        enable_auto_reindex: bool = True,
+        resilience_manager: SimpleResilienceManager | None = None,
+        reranker_service=None,
         reranker_model_name: str | None = None,
-        resilience_manager: ResilienceManager | None = None,
-        reranker_service: RerankerService | None = None,
-        query_processor: QueryProcessor | None = None,
+        query_processor: QueryProcessorService | None = None,
+        context_service: ContextService | None = None,
+        scoring_service: ScoringService | None = None,
     ) -> None:
-        """Initialize semantic search engine.
-
-        Args:
-            database: Vector database instance
-            project_root: Project root directory
-            similarity_threshold: Default similarity threshold
-            auto_indexer: Optional auto-indexer for semi-automatic reindexing
-            enable_auto_reindex: Whether to enable automatic reindexing
-            reranker_model_name: Optional neural reranker model name (e.g., jinaai/jina-reranker-v2-base-multilingual)
-        """
         self.database = database
         self.project_root = project_root
         self.similarity_threshold = similarity_threshold
-        self.auto_indexer = auto_indexer
-        self.enable_auto_reindex = enable_auto_reindex
-        # Allow default model from project constants if not explicitly provided
-        from ..config.constants import DEFAULT_RERANKER_MODEL
 
-        self.reranker_model_name = reranker_model_name or DEFAULT_RERANKER_MODEL
-        self._reranker_model = None
-        self._reranker_tokenizer = None
+        self.search_triggered_indexer = (
+            SearchTriggeredIndexer(auto_indexer) if auto_indexer is not None else None
+        )
 
-        # Initialize search-triggered indexer if auto-indexer is provided
-        self.search_triggered_indexer = None
-        if auto_indexer and enable_auto_reindex:
-            self.search_triggered_indexer = SearchTriggeredIndexer(auto_indexer)
-
-        # File content cache for performance (proper LRU with OrderedDict)
-        self._file_cache: OrderedDict[Path, list[str]] = OrderedDict()
-        self._cache_maxsize = DEFAULT_CACHE_SIZE
-        self._cache_hits = 0
-        self._cache_misses = 0
-
-        # Health check throttling (only check every 60 seconds)
-        self._last_health_check: float = 0.0
-        self._health_check_interval: float = 60.0
-
-        # Boilerplate filter for smart result ranking
-        self._boilerplate_filter = BoilerplateFilter()
-
-        # RAG Guards for quality and security
-        self.rag_guard = RAGGuard()
-
-        # Git Manager for recency boosting
         try:
             self.git_manager = GitManager(project_root)
         except Exception:
             self.git_manager = None
 
-        # Dependency-injected services (with sensible defaults)
-        # Lazy defaults: SimpleResilienceManager and global reranker
-        self.resilience_manager: ResilienceManager = (
-            resilience_manager or SimpleResilienceManager()
-        )
-        # If a concrete reranker service provided, respect it; otherwise use global singleton
-        self.reranker_service: RerankerService = (
-            reranker_service or get_global_reranker(self.reranker_model_name)
-        )
+        self.rag_guard = RAGGuard()
 
-        # Default QueryProcessor that delegates to existing _preprocess_query
-        if query_processor is not None:
-            self.query_processor = query_processor
-        else:
-            class _DefaultQP:
-                async def process(inner_self, q: str) -> str:
-                    return self._preprocess_query(q)
+        self.resilience_manager = resilience_manager or SimpleResilienceManager()
+        self.reranker_service = reranker_service or get_global_reranker(reranker_model_name)
 
-            self.query_processor: QueryProcessor = _DefaultQP()
+        self.context_service: ContextService = context_service or DefaultContextService()
+        self.query_processor: QueryProcessorService = (
+            query_processor or DefaultQueryProcessor()
+        )
+        self.scoring_service = scoring_service or ScoringService(self.similarity_threshold)
+        self.discovery_service = DiscoveryService(self)
+
+        # Lightweight throttling
+        self._last_health_check = 0.0
+        self._health_check_interval = 60.0
 
     @staticmethod
     def _is_rust_panic_error(error: Exception) -> bool:
@@ -247,10 +158,7 @@ class SemanticSearchEngine:
                 if hasattr(self.database, "health_check"):
                     is_healthy = await self.database.health_check()
                     if not is_healthy:
-                        logger.warning(
-                            "Database health check failed - attempting recovery"
-                        )
-                        # Health check already attempts recovery, so we can proceed
+                        logger.warning("Database health check failed - attempting recovery")
                     self._last_health_check = current_time
             except Exception as e:
                 logger.warning(f"Health check failed: {e}")
@@ -266,7 +174,7 @@ class SemanticSearchEngine:
         threshold = (
             similarity_threshold
             if similarity_threshold is not None
-            else self._get_adaptive_threshold(query)
+            else self.scoring_service.adaptive_threshold(query)
         )
 
         # Update active files for RAG Guard (Recency Guard)
@@ -296,10 +204,24 @@ class SemanticSearchEngine:
                 logger.error(f"Resilience manager rejected request: {sue}")
                 return []
 
-            # Post-process results (context enrichment)
+            # Post-process results (context enrichment) via ContextService
             enhanced_results = []
             for result in results:
-                enhanced_result = await self._enhance_result(result, include_context)
+                enhanced_result = await self.context_service.get_context(result, include_context)
+                # Stale-index detection: if SearchResult has content_hash and DB provides lookup, warn
+                try:
+                    if getattr(enhanced_result, "content_hash", None) and hasattr(self.database, "get_chunks_by_hash"):
+                        matches = await self.database.get_chunks_by_hash(enhanced_result.content_hash)
+                        location_match = any(
+                            (str(m.file_path) == str(enhanced_result.file_path) and m.start_line == enhanced_result.start_line and m.end_line == enhanced_result.end_line)
+                            for m in matches
+                        )
+                        if not location_match:
+                            logger.warning(
+                                f"Stale index detected for {enhanced_result.file_path}:{enhanced_result.start_line}-{enhanced_result.end_line} (content_hash mismatch)"
+                            )
+                except Exception:
+                    pass
                 enhanced_results.append(enhanced_result)
 
             # Rerank via injected reranker service
@@ -315,7 +237,7 @@ class SemanticSearchEngine:
                     recent = set(str(f) for f in self.git_manager.get_changed_files())
                     for r in ranked_results:
                         if str(r.file_path) in recent:
-                            r.similarity_score = min(1.0, r.similarity_score + self._BOOST_SOURCE_FILE)
+                            r.similarity_score = min(1.0, r.similarity_score + self.scoring_service.boost_source_file)
                 except Exception:
                     pass
 
@@ -378,810 +300,6 @@ class SemanticSearchEngine:
             logger.error(f"Unexpected search error for query '{query}': {e}")
             return []
 
-    async def search_similar(
-        self,
-        file_path: Path,
-        function_name: str | None = None,
-        limit: int = 10,
-        similarity_threshold: float | None = None,
-    ) -> list[SearchResult]:
-        """Find code similar to a specific function or file.
-
-        Args:
-            file_path: Path to the reference file
-            function_name: Specific function name (optional)
-            limit: Maximum number of results
-            similarity_threshold: Minimum similarity score
-
-        Returns:
-            List of similar code results
-        """
-        try:
-            # Read the reference file using async I/O
-            async with aiofiles.open(file_path, encoding="utf-8") as f:
-                content = await f.read()
-
-            # If function name is specified, try to extract just that function
-            if function_name:
-                function_content = self._extract_function_content(
-                    content, function_name
-                )
-                if function_content:
-                    content = function_content
-
-            # Use the content as the search query
-            return await self.search(
-                query=content,
-                limit=limit,
-                similarity_threshold=similarity_threshold,
-                include_context=True,
-            )
-
-        except Exception as e:
-            logger.error(f"Similar search failed for {file_path}: {e}")
-            raise SearchError(f"Similar search failed: {e}") from e
-
-    async def find_symbol(
-        self,
-        symbol_name: str,
-        symbol_type: str | None = None,
-    ) -> list[SearchResult]:
-        """Find exact symbol definition (class or function).
-
-        Args:
-            symbol_name: Exact name of the function or class
-            symbol_type: Optional filter for chunk type ('class' or 'function')
-
-        Returns:
-            List of matching results formatted as SearchResult
-        """
-        logger.debug(f"Symbolic lookup for: {symbol_name} (type: {symbol_type})")
-
-        # Perform exact metadata lookup in database
-        chunks = await self.database.get_chunks_by_symbol(symbol_name, symbol_type)
-
-        if chunks:
-            logger.info(f"[HASSASİYET] 🔍 Sembol Navigasyonu: '{symbol_name}' doğrudan saptandı, semantik gürültü devre dışı bırakıldı.")
-
-        # Convert to SearchResult
-        results = []
-        for i, chunk in enumerate(chunks):
-            # Determine symbol context
-            ct = chunk.chunk_type or "code"
-            if ct in ("function", "method"):
-                sym_ctx = "function"
-            elif ct == "class":
-                sym_ctx = "class"
-            else:
-                sym_ctx = "global"
-
-            nav_hint = f"{chunk.file_path}:{chunk.start_line}"
-
-            results.append(
-                SearchResult(
-                    content=chunk.content,
-                    file_path=chunk.file_path,
-                    start_line=chunk.start_line,
-                    end_line=chunk.end_line,
-                    language=chunk.language,
-                    similarity_score=1.0,  # Exact matches get perfect score
-                    rank=i + 1,
-                    chunk_type=ct,
-                    function_name=chunk.function_name,
-                    class_name=chunk.class_name,
-                    quality_score=100,
-                    symbol_context=sym_ctx,
-                    navigation_hint=nav_hint,
-                    suggested_next_action=(
-                        {"tool": "find_references", "input": {"relative_path": str(chunk.file_path), "line": int(chunk.start_line), "character": 1}, "message": f"Bu sembolün referanslarını görmek için 'find_references' aracını kullanabilirsin (örn. {chunk.file_path}:{chunk.start_line})."}
-                        if sym_ctx in ("function", "class")
-                        else {"tool": "get_hover_info", "input": {"relative_path": str(chunk.file_path), "line": int(chunk.start_line), "character": 1}, "message": f"Daha fazla bilgi için 'get_hover_info' aracıyla bu konumu inceleyebilirsin (örn. {chunk.file_path}:{chunk.start_line})."}
-                    ),
-                )
-            )
-
-        return results
-
-    async def search_by_context(
-        self,
-        context_description: str,
-        focus_areas: list[str] | None = None,
-        limit: int = 10,
-    ) -> list[SearchResult]:
-        """Search for code based on contextual description.
-
-        Args:
-            context_description: Description of what you're looking for
-            focus_areas: Areas to focus on (e.g., ["security", "authentication"])
-            limit: Maximum number of results
-
-        Returns:
-            List of contextually relevant results
-        """
-        # Build enhanced query with focus areas
-        query_parts = [context_description]
-
-        if focus_areas:
-            query_parts.extend(focus_areas)
-
-        enhanced_query = " ".join(query_parts)
-
-        return await self.search(
-            query=enhanced_query,
-            limit=limit,
-            include_context=True,
-        )
-
-    def _preprocess_query(self, query: str) -> str:
-        """Preprocess search query for better results.
-
-        Args:
-            query: Raw search query
-
-        Returns:
-            Processed query
-        """
-        # Remove extra whitespace
-        query = re.sub(r"\s+", " ", query.strip())
-
-        # Use class-level query expansions (no dict creation overhead)
-        words = query.lower().split()
-        expanded_words = []
-
-        for word in words:
-            # Add original word
-            expanded_words.append(word)
-
-            # Add expansions if available
-            if word in self._QUERY_EXPANSIONS:
-                expanded_words.extend(self._QUERY_EXPANSIONS[word].split())
-
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_words = []
-        for word in expanded_words:
-            if word not in seen:
-                seen.add(word)
-                unique_words.append(word)
-
-        return " ".join(unique_words)
-
-    def _get_adaptive_threshold(self, query: str) -> float:
-        """Get adaptive similarity threshold based on query characteristics.
-
-        Args:
-            query: Search query
-
-        Returns:
-            Adaptive similarity threshold
-        """
-        base_threshold = self.similarity_threshold
-        query_lower = query.lower()
-        words = query.split()
-
-        # Adjust threshold based on query characteristics
-
-        # 1. Single word queries - lower threshold for broader results
-        if len(words) == 1:
-            return max(0.01, base_threshold - 0.29)
-
-        # 2. Very specific technical terms - lower threshold
-        technical_terms = [
-            "javascript",
-            "typescript",
-            "python",
-            "java",
-            "cpp",
-            "rust",
-            "go",
-            "function",
-            "class",
-            "method",
-            "variable",
-            "import",
-            "export",
-            "async",
-            "await",
-            "promise",
-            "callback",
-            "api",
-            "database",
-            "parser",
-            "compiler",
-            "interpreter",
-            "syntax",
-            "semantic",
-            "mcp",
-            "gateway",
-            "server",
-            "client",
-            "protocol",
-        ]
-
-        if any(term in query_lower for term in technical_terms):
-            return max(0.01, base_threshold - 0.29)
-
-        # 3. Short queries (2-3 words) - slightly lower threshold
-        if len(words) <= 3:
-            return max(0.1, base_threshold - 0.1)
-
-        # 4. Long queries (>6 words) - higher threshold for precision
-        if len(words) > 6:
-            return min(0.8, base_threshold + 0.1)
-
-        # 5. Queries with exact identifiers (CamelCase, snake_case)
-        if re.search(r"\b[A-Z][a-zA-Z]*\b", query) or "_" in query:
-            return max(0.05, base_threshold - 0.25)
-
-        # 6. Common programming patterns
-        if any(pattern in query for pattern in ["()", ".", "->", "=>", "::"]):
-            return max(0.25, base_threshold - 0.1)
-
-        return base_threshold
-
-    async def _read_file_lines_cached(self, file_path: Path) -> list[str]:
-        """Read file lines with proper LRU caching for performance.
-
-        Args:
-            file_path: Path to the file
-
-        Returns:
-            List of file lines
-
-        Raises:
-            FileNotFoundError: If file doesn't exist
-        """
-        # Check cache - move to end if found (most recently used)
-        if file_path in self._file_cache:
-            self._cache_hits += 1
-            # Move to end (most recently used)
-            self._file_cache.move_to_end(file_path)
-            return self._file_cache[file_path]
-
-        self._cache_misses += 1
-
-        # Read file asynchronously
-        try:
-            async with aiofiles.open(file_path, encoding="utf-8") as f:
-                content = await f.read()
-                lines = content.splitlines(keepends=True)
-
-            # Proper LRU: if cache is full, remove least recently used (first item)
-            if len(self._file_cache) >= self._cache_maxsize:
-                # Remove least recently used entry (first item in OrderedDict)
-                self._file_cache.popitem(last=False)
-
-            # Add to cache (will be at end, most recently used)
-            self._file_cache[file_path] = lines
-            return lines
-
-        except FileNotFoundError:
-            # Cache the miss to avoid repeated failed attempts
-            if len(self._file_cache) >= self._cache_maxsize:
-                self._file_cache.popitem(last=False)
-            self._file_cache[file_path] = []
-            raise
-
-    async def _enhance_result(
-        self, result: SearchResult, include_context: bool
-    ) -> SearchResult:
-        """Enhance search result with additional information.
-
-        Args:
-            result: Original search result
-            include_context: Whether to include context lines
-
-        Returns:
-            Enhanced search result
-        """
-        if not include_context:
-            return result
-
-        try:
-            # Read the source file using cached method
-            lines = await self._read_file_lines_cached(result.file_path)
-
-            if not lines:  # File not found or empty
-                return result
-
-            # Get context lines before and after
-            context_size = 3
-            start_idx = max(0, result.start_line - 1 - context_size)
-            end_idx = min(len(lines), result.end_line + context_size)
-
-            context_before = [
-                line.rstrip() for line in lines[start_idx : result.start_line - 1]
-            ]
-            context_after = [line.rstrip() for line in lines[result.end_line : end_idx]]
-
-            # Update result with context
-            result.context_before = context_before
-            result.context_after = context_after
-
-            # Detect stale index by verifying content_hash exists in DB for this location
-            try:
-                if result.content_hash and hasattr(self.database, "get_chunks_by_hash"):
-                    matches = await self.database.get_chunks_by_hash(result.content_hash)
-                    # Check whether any match corresponds to the same location
-                    location_match = any(
-                        (str(m.file_path) == str(result.file_path) and m.start_line == result.start_line and m.end_line == result.end_line)
-                        for m in matches
-                    )
-                    if not location_match:
-                        logger.warning(
-                            f"Stale index detected for {result.file_path}:{result.start_line}-{result.end_line} (content_hash mismatch)"
-                        )
-            except Exception:
-                # Don't fail enhancement if the DB check fails
-                pass
-
-        except FileNotFoundError:
-            # File was deleted since indexing - silently skip context
-            # This is normal when index is stale; use --force to reindex
-            logger.debug(f"File no longer exists (stale index): {result.file_path}")
-            result.file_missing = True  # Mark for potential filtering
-        except Exception as e:
-            logger.warning(f"Failed to get context for {result.file_path}: {e}")
-
-        return result
-
-    # NOTE: reranking and advanced heuristic ranking have been delegated to
-    # `RerankerService` implementations. The legacy local reranking logic was
-    # intentionally removed in favor of service-based, testable components.
-
-    def analyze_query(self, query: str) -> dict[str, Any]:
-        """Analyze search query and provide suggestions for improvement.
-
-        Args:
-            query: Search query to analyze
-
-        Returns:
-            Dictionary with analysis results and suggestions
-        """
-        analysis = {
-            "original_query": query,
-            "processed_query": self._preprocess_query(query),
-            "query_type": "general",
-            "suggestions": [],
-            "confidence": "medium",
-        }
-
-        query_lower = query.lower()
-
-        # Detect query type
-        if any(word in query_lower for word in ["function", "method", "def", "func"]):
-            analysis["query_type"] = "function_search"
-            analysis["suggestions"].append(
-                "Try searching for specific function names or patterns"
-            )
-        elif any(word in query_lower for word in ["class", "object", "type"]):
-            analysis["query_type"] = "class_search"
-            analysis["suggestions"].append(
-                "Include class inheritance or interface information"
-            )
-        elif any(word in query_lower for word in ["error", "exception", "bug", "fix"]):
-            analysis["query_type"] = "error_handling"
-            analysis["suggestions"].append("Include error types or exception names")
-        elif any(word in query_lower for word in ["test", "spec", "mock"]):
-            analysis["query_type"] = "testing"
-            analysis["suggestions"].append("Specify test framework or testing patterns")
-        elif any(word in query_lower for word in ["config", "setting", "option"]):
-            analysis["query_type"] = "configuration"
-            analysis["suggestions"].append(
-                "Include configuration file types or setting names"
-            )
-
-        # Analyze query complexity
-        words = query.split()
-        if len(words) == 1:
-            analysis["confidence"] = "low"
-            analysis["suggestions"].append(
-                "Try adding more descriptive words for better results"
-            )
-        elif len(words) > 10:
-            analysis["confidence"] = "low"
-            analysis["suggestions"].append(
-                "Consider simplifying your query for better matching"
-            )
-        else:
-            analysis["confidence"] = "high"
-
-        # Check for common programming patterns
-        if re.search(r"\b\w+\(\)", query):
-            analysis["suggestions"].append(
-                "Function call detected - searching for function definitions"
-            )
-        if re.search(r"\b[A-Z][a-zA-Z]*\b", query):
-            analysis["suggestions"].append(
-                "CamelCase detected - searching for class or type names"
-            )
-        if re.search(r"\b\w+\.\w+", query):
-            analysis["suggestions"].append(
-                "Dot notation detected - searching for method calls or properties"
-            )
-
-        return analysis
-
-    def suggest_related_queries(
-        self, query: str, results: list[SearchResult]
-    ) -> list[str]:
-        """Suggest related queries based on search results.
-
-        Args:
-            query: Original search query
-            results: Search results
-
-        Returns:
-            List of suggested related queries
-        """
-        suggestions = []
-
-        if not results:
-            # No results - suggest broader queries
-            words = query.lower().split()
-            if len(words) > 1:
-                # Try individual words
-                suggestions.extend(words[:3])  # Top 3 words
-
-            # Suggest common related terms
-            related_terms = {
-                "auth": ["login", "user", "session", "token"],
-                "database": ["query", "model", "schema", "connection"],
-                "api": ["endpoint", "request", "response", "handler"],
-                "test": ["mock", "assert", "spec", "unit"],
-                "error": ["exception", "handle", "catch", "debug"],
-            }
-
-            for word in words:
-                if word in related_terms:
-                    suggestions.extend(related_terms[word][:2])
-        else:
-            # Extract common patterns from results
-            function_names = [r.function_name for r in results if r.function_name]
-            class_names = [r.class_name for r in results if r.class_name]
-
-            # Suggest function names
-            if function_names:
-                unique_functions = list(set(function_names))[:3]
-                suggestions.extend(unique_functions)
-
-            # Suggest class names
-            if class_names:
-                unique_classes = list(set(class_names))[:3]
-                suggestions.extend(unique_classes)
-
-            # Suggest file-based queries
-            file_patterns = set()
-            for result in results[:5]:  # Top 5 results
-                file_name = result.file_path.stem
-                if "_" in file_name:
-                    file_patterns.update(file_name.split("_"))
-                elif file_name not in suggestions:
-                    file_patterns.add(file_name)
-
-            suggestions.extend(list(file_patterns)[:3])
-
-        # Remove duplicates and original query words
-        query_words = set(query.lower().split())
-        unique_suggestions = []
-        for suggestion in suggestions:
-            if (
-                suggestion
-                and suggestion.lower() not in query_words
-                and suggestion not in unique_suggestions
-            ):
-                unique_suggestions.append(suggestion)
-
-        return unique_suggestions[:5]  # Return top 5 suggestions
-
-    async def search_with_context(
-        self,
-        query: str,
-        context_files: list[Path] | None = None,
-        limit: int = 10,
-        similarity_threshold: float | None = None,
-    ) -> dict[str, Any]:
-        """Enhanced search with contextual analysis and suggestions.
-
-        Args:
-            query: Search query
-            context_files: Optional list of files to provide context
-            limit: Maximum number of results
-            similarity_threshold: Minimum similarity score
-
-        Returns:
-            Dictionary with results, analysis, and suggestions
-        """
-        # Analyze the query
-        query_analysis = self.analyze_query(query)
-
-        # Perform the search
-        results = await self.search(
-            query=query,
-            limit=limit,
-            similarity_threshold=similarity_threshold,
-            include_context=True,
-        )
-
-        # Get related query suggestions
-        suggestions = self.suggest_related_queries(query, results)
-
-        # Enhance results with additional context if context files provided
-        if context_files:
-            results = await self._enhance_with_file_context(results, context_files)
-
-        # Calculate result quality metrics
-        quality_metrics = self._calculate_result_quality(results, query)
-
-        return {
-            "query": query,
-            "analysis": query_analysis,
-            "results": results,
-            "suggestions": suggestions,
-            "metrics": quality_metrics,
-            "total_results": len(results),
-        }
-
-    async def _enhance_with_file_context(
-        self, results: list[SearchResult], context_files: list[Path]
-    ) -> list[SearchResult]:
-        """Enhance results by considering context from specific files.
-
-        Args:
-            results: Original search results
-            context_files: Files to use for context
-
-        Returns:
-            Enhanced search results
-        """
-        # Read context from files using async I/O
-        context_content = []
-        for file_path in context_files:
-            try:
-                async with aiofiles.open(file_path, encoding="utf-8") as f:
-                    content = await f.read()
-                    context_content.append(content)
-            except Exception as e:
-                logger.warning(f"Failed to read context file {file_path}: {e}")
-
-        if not context_content:
-            return results
-
-        # Boost results that are related to context files
-        context_text = " ".join(context_content).lower()
-
-        for result in results:
-            # Check if result is from one of the context files
-            if result.file_path in context_files:
-                result.similarity_score = min(1.0, result.similarity_score + 0.1)
-
-            # Check if result content relates to context
-            result.content.lower()
-            if result.function_name:
-                func_name_lower = result.function_name.lower()
-                if func_name_lower in context_text:
-                    result.similarity_score = min(1.0, result.similarity_score + 0.05)
-
-            if result.class_name:
-                class_name_lower = result.class_name.lower()
-                if class_name_lower in context_text:
-                    result.similarity_score = min(1.0, result.similarity_score + 0.05)
-
-        # Re-sort by updated scores
-        results.sort(key=lambda r: r.similarity_score, reverse=True)
-
-        # Update ranks
-        for i, result in enumerate(results):
-            result.rank = i + 1
-
-        return results
-
-    def _calculate_result_quality(
-        self, results: list[SearchResult], query: str
-    ) -> dict[str, Any]:
-        """Calculate quality metrics for search results.
-
-        Args:
-            results: Search results
-            query: Original query
-
-        Returns:
-            Dictionary with quality metrics
-        """
-        if not results:
-            return {
-                "average_score": 0.0,
-                "score_distribution": {},
-                "diversity": 0.0,
-                "coverage": 0.0,
-            }
-
-        # Calculate average similarity score
-        scores = [r.similarity_score for r in results]
-        avg_score = sum(scores) / len(scores)
-
-        # Score distribution
-        high_quality = sum(1 for s in scores if s >= 0.8)
-        medium_quality = sum(1 for s in scores if 0.6 <= s < 0.8)
-        low_quality = sum(1 for s in scores if s < 0.6)
-
-        # Diversity (unique files)
-        unique_files = len({r.file_path for r in results})
-        diversity = unique_files / len(results) if results else 0.0
-
-        # Coverage (how many query words are covered)
-        query_words = set(query.lower().split())
-        covered_words = set()
-        for result in results:
-            content_words = set(result.content.lower().split())
-            covered_words.update(query_words.intersection(content_words))
-
-        coverage = len(covered_words) / len(query_words) if query_words else 0.0
-
-        return {
-            "average_score": round(avg_score, 3),
-            "score_distribution": {
-                "high_quality": high_quality,
-                "medium_quality": medium_quality,
-                "low_quality": low_quality,
-            },
-            "diversity": round(diversity, 3),
-            "coverage": round(coverage, 3),
-        }
-
-    async def get_symbol_relationships(
-        self, symbol_name: str
-    ) -> dict[str, Any]:
-        """Explore relationships for a symbol (callers, callees, siblings).
-
-        Args:
-            symbol_name: Name of the function or class
-
-        Returns:
-            Dictionary containing relationship data
-        """
-        logger.debug(f"Exploring relationships for symbol: {symbol_name}")
-
-        # 1. Get the chunk(s) for this symbol
-        target_chunks = await self.database.get_chunks_by_symbol(symbol_name)
-        if not target_chunks:
-            return {"error": f"Symbol '{symbol_name}' not found."}
-
-        # For simplicity, focus on the first definition found
-        target_chunk = target_chunks[0]
-        all_chunks = await self.database.get_all_chunks()
-
-        # 2. Find Callers (who calls this symbol?)
-        callers = []
-        for chunk in all_chunks:
-            if str(chunk.file_path) == str(target_chunk.file_path):
-                continue
-
-            # Need to import extract_function_calls here or move it to a shared location
-            from .relationships import extract_function_calls
-            if symbol_name in extract_function_calls(chunk.content, chunk.language):
-                callers.append({
-                    "name": chunk.function_name or chunk.class_name or f"L{chunk.start_line}",
-                    "file": str(chunk.file_path),
-                    "type": chunk.chunk_type
-                })
-
-        # 3. Find Callees (who does this symbol call?)
-        from .relationships import extract_function_calls
-        outgoing_calls = extract_function_calls(target_chunk.content, target_chunk.language)
-        callees = []
-        for call in outgoing_calls:
-            # Check if this call is an internal symbol we know about
-            definitions = await self.database.get_chunks_by_symbol(call)
-            if definitions:
-                callees.append({
-                    "name": call,
-                    "file": str(definitions[0].file_path),
-                    "type": definitions[0].chunk_type
-                })
-
-        # 4. Find Semantic Siblings (conceptually similar code)
-        siblings = await self.search(
-            query=target_chunk.content[:500],
-            limit=5,
-            similarity_threshold=0.4
-        )
-        # Filter out the symbol itself from siblings
-        siblings = [s for s in siblings if not (s.file_path == target_chunk.file_path and s.start_line == target_chunk.start_line)]
-
-        return {
-            "symbol": symbol_name,
-            "definition": {
-                "file": str(target_chunk.file_path),
-                "lines": f"{target_chunk.start_line}-{target_chunk.end_line}",
-                "type": target_chunk.chunk_type
-            },
-            "callers": callers,
-            "callees": callees,
-            "semantic_siblings": [
-                {
-                    "name": s.function_name or s.class_name or "code_block",
-                    "file": str(s.file_path),
-                    "similarity": round(s.similarity_score, 3)
-                } for s in siblings
-            ]
-        }
-
-    def _extract_function_content(self, content: str, function_name: str) -> str | None:
-        """Extract content of a specific function from code.
-
-        Args:
-            content: Full file content
-            function_name: Name of function to extract
-
-        Returns:
-            Function content if found, None otherwise
-        """
-        # Simple regex-based extraction (could be improved with AST)
-        pattern = rf"^\s*def\s+{re.escape(function_name)}\s*\("
-        lines = content.splitlines()
-
-        for i, line in enumerate(lines):
-            if re.match(pattern, line):
-                # Found function start, now find the end
-                start_line = i
-                indent_level = len(line) - len(line.lstrip())
-
-                # Find end of function
-                end_line = len(lines)
-                for j in range(i + 1, len(lines)):
-                    if lines[j].strip():  # Skip empty lines
-                        current_indent = len(lines[j]) - len(lines[j].lstrip())
-                        if current_indent <= indent_level:
-                            end_line = j
-                            break
-
-                return "\n".join(lines[start_line:end_line])
-
-        return None
-
-    async def get_search_stats(self) -> dict[str, Any]:
-        """Get search engine statistics.
-
-        Returns:
-            Dictionary with search statistics
-        """
-        try:
-            db_stats = await self.database.get_stats()
-
-            return {
-                "total_chunks": db_stats.total_chunks,
-                "languages": db_stats.languages,
-                "similarity_threshold": self.similarity_threshold,
-                "project_root": str(self.project_root),
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to get search stats: {e}")
-            return {"error": str(e)}
-
-    def clear_cache(self) -> None:
-        """Clear the file read cache."""
-        self._file_cache.clear()
-        self._cache_hits = 0
-        self._cache_misses = 0
-        logger.debug("File read cache cleared")
-
-    def get_cache_info(self) -> dict[str, Any]:
-        """Get cache statistics.
-
-        Returns:
-            Dictionary with cache statistics including hits, misses, size, and hit rate
-        """
-        total_requests = self._cache_hits + self._cache_misses
-        hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0.0
-
-        return {
-            "hits": self._cache_hits,
-            "misses": self._cache_misses,
-            "size": len(self._file_cache),
-            "maxsize": self._cache_maxsize,
-            "hit_rate": f"{hit_rate:.2%}",
-        }
+    # Delegate discovery helpers to DiscoveryService (keeps this module small)
 
 
