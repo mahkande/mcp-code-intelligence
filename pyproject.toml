@@ -47,8 +47,15 @@ dependencies = [
     "py-mcp-installer>=0.1.4",
     "orjson>=3.9.0",
     "einops",
-    "torch>=2.0.0",
 ]
+
+[project.optional-dependencies]
+# Optional ML / neural reranking dependencies
+ml = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+]
+
 
 [dependency-groups]
 dev = [
