@@ -13,12 +13,16 @@ from ..interfaces import RerankerService
 from ..models import SearchResult
 
 
-try:
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-    import torch
-    HAS_TRANSFORMERS = True
-except Exception:
-    HAS_TRANSFORMERS = False
+
+def _check_transformers():
+    try:
+        import transformers
+        import torch
+        return True
+    except ImportError:
+        return False
+
+HAS_TRANSFORMERS = _check_transformers()
 
 
 class LazyHFReRanker(RerankerService):
@@ -33,26 +37,46 @@ class LazyHFReRanker(RerankerService):
         self.device = device
         self._model = None
         self._tokenizer = None
+        self._device_str = None  # Track device string for logging
 
     def _ensure_loaded(self) -> None:
         if not HAS_TRANSFORMERS or not self.model_name:
             return
         if self._model is None or self._tokenizer is None:
-            # Import locally to keep discovery light-weight
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-            # Move to device if torch available and device resolved
-            if hasattr(self._model, "to"):
-                dev = self.device or ("cuda" if hasattr(__import__("torch"), "cuda") and __import__("torch").cuda.is_available() else "cpu")
-                try:
-                    self._model.to(dev)
-                except Exception:
-                    pass
+            try:
+                from transformers import AutoModelForSequenceClassification, AutoTokenizer
+                import torch
+                self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+                # Detect device
+                dev = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+                self._device_str = dev
+                # Log device info at model load
+                from mcp_vector_search.logger_config import logger
+                logger.info(f"[JinaLocal] Model yükleniyor: {self.model_name} | Device: {dev.upper()} (torch.cuda.is_available={torch.cuda.is_available()})")
+                if hasattr(self._model, "to"):
+                    try:
+                        self._model.to(dev)
+                    except Exception as e:
+                        logger.warning(f"[JinaLocal] Model device'a taşınamadı: {e}")
+            except ImportError:
+                raise ImportError("'transformers' ve 'torch' paketleri gerekli. Lütfen 'pip install .[ml]' komutunu çalıştırın.")
 
     async def rerank(self, results: List[SearchResult], query: str) -> List[SearchResult]:
         # No-op if transformers or model not configured
         if not HAS_TRANSFORMERS or not self.model_name:
             return results
+
+        from mcp_vector_search.logger_config import logger
+        import time
+
+        def _top3_log(res, label):
+            msg = f"[Reranker] {label} ilk 3: "
+            for i, r in enumerate(res[:3]):
+                msg += f"Rank {i+1}: {getattr(r, 'file_path', '?')} (Score: {getattr(r, 'similarity_score', '?')}) | "
+            logger.info(msg.rstrip(' | '))
+
+        _top3_log(results, "Önce")
 
         loop = asyncio.get_event_loop()
 
@@ -65,37 +89,58 @@ class LazyHFReRanker(RerankerService):
                 # Prepare pairwise inputs: [query || candidate_text]
                 inputs = []
                 for r in results:
-                    # Heuristic: prefer short preview if present, else file path
                     preview = getattr(r, "preview_text", None) or getattr(r, "text", None) or str(getattr(r, "file_path", ""))
                     inputs.append(f"{query} </s> {preview}")
 
+                import torch as _torch
+                import torch.nn.functional as F
+
                 enc = self._tokenizer(inputs, truncation=True, padding=True, return_tensors="pt")
                 # Move tensors to model device if possible
+                device = next(self._model.parameters()).device
+                enc = {k: v.to(device) for k, v in enc.items()}
+
+                # Inference time measurement
+                start_time = time.time()
+                with _torch.no_grad():
+                    logits = self._model(**enc).logits
+                    probs = F.softmax(logits, dim=-1)
+                    scores = probs[:, -1].cpu().numpy()
+                duration = time.time() - start_time
+
+                # Log tensor shape and inference time
+                logger.debug(f"[JinaLocal] Model output logits shape: {getattr(logits, 'shape', '?')}")
+                logger.info(f"⚡ Jina Local Inference: {duration:.3f}s | Device: {self._device_str or device}")
+
+                # Log memory usage (RAM/VRAM)
                 try:
-                    import torch as _torch
-                    device = next(self._model.parameters()).device
-                    enc = {k: v.to(device) for k, v in enc.items()}
-                    with _torch.no_grad():
-                        logits = self._model(**enc).logits
-                        # Assume binary classification; use positive class prob if present
-                        import torch.nn.functional as F
-                        probs = F.softmax(logits, dim=-1)
-                        scores = probs[:, -1].cpu().numpy()
+                    ram_mb = None
+                    vram_mb = None
+                    import psutil
+                    ram_mb = psutil.Process().memory_info().rss / 1024 / 1024
+                    logger.info(f"[JinaLocal] RAM Usage: {ram_mb:.1f} MB")
                 except Exception:
-                    # Fallback: treat logits as scores if any
-                    try:
-                        logits = self._model(**enc).logits
-                        scores = logits.mean(dim=-1).cpu().numpy()
-                    except Exception:
-                        return results
+                    pass
+                try:
+                    if _torch.cuda.is_available():
+                        vram_mb = _torch.cuda.memory_allocated() / 1024 / 1024
+                        logger.info(f"[JinaLocal] VRAM Usage: {vram_mb:.1f} MB")
+                except Exception:
+                    pass
 
                 scored = list(zip(scores.tolist(), results))
                 scored.sort(key=lambda x: x[0], reverse=True)
-                return [r for _, r in scored]
-            except Exception:
+                reranked = [r for _, r in scored]
+                return reranked
+            except ImportError as e:
+                logger.warning(f"Opsiyonel ML bağımlılığı eksik: {e}")
+                return results
+            except Exception as ex:
+                logger.error(f"[JinaLocal] Rerank exception: {ex}")
                 return results
 
         ranked = await loop.run_in_executor(None, _sync_rerank)
+        _top3_log(ranked, "Sonra")
         return ranked
 
 

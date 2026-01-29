@@ -138,7 +138,7 @@ async def test_stale_index_logging(tmp_path, monkeypatch):
     mock_logger.warning = Mock()
     monkeypatch.setattr(search_mod, "logger", mock_logger)
 
-    await engine._enhance_result(sr, include_context=True)
+    await engine.context_service.get_context(sr, include_context=True)
 
     mock_logger.warning.assert_called()
 

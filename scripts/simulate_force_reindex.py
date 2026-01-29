@@ -1,16 +1,17 @@
-import asyncio
-from pathlib import Path
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+"""Compatibility wrapper: use the admin version under `scripts/admin/`.
 
-from mcp_code_intelligence.core.relationships import RelationshipStore
+This file remains as a thin compatibility shim to avoid breaking external
+invocations that expect `scripts/simulate_force_reindex.py`.
+"""
+from importlib import import_module
 
-async def main():
-    project_root = Path(__file__).resolve().parents[1]
-    rs = RelationshipStore(project_root)
-    rs.invalidate()
-    res = await rs.compute_and_store([], database=None, background=True)
-    print('compute_and_store returned:', res)
+_mod = import_module("scripts.admin.simulate_force_reindex")
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    # Delegate to admin script
+    _mod.__name__ = "__main__"
+    # Execute module-level main if present
+    try:
+        _mod.__dict__.get("main") and __import__("asyncio").run(_mod.main())
+    except Exception as e:
+        raise

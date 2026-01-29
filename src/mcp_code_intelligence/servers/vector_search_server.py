@@ -19,12 +19,15 @@ except Exception:
     chromadb = None
     CHROMADB_AVAILABLE = False
 
-try:
-    import onnxruntime  # type: ignore
-    ONNX_AVAILABLE = True
-except Exception:
-    onnxruntime = None
-    ONNX_AVAILABLE = False
+
+def _check_onnxruntime_available():
+    try:
+        import onnxruntime  # type: ignore
+        return True
+    except ImportError:
+        return False
+    except Exception:
+        return False
 
 
 def get_advertised_tools(project_root: Path) -> List[Tool]:
@@ -50,8 +53,9 @@ def get_advertised_tools(project_root: Path) -> List[Tool]:
             )
         ]
 
+
     # If ONNX is optional for certain embedding models, advertise a fix if absent
-    if not ONNX_AVAILABLE:
+    if not _check_onnxruntime_available():
         # Not fatal for all Chromadb setups, but surface a remediation option.
         return [
             Tool(

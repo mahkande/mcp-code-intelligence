@@ -1,3 +1,4 @@
+"""
 """Central registry for tool metadata used by MCP servers and CLI chat.
 
 Provides a single source of truth for tool descriptions, schemas and LLM
@@ -18,8 +19,8 @@ _TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "search_code",
         "description": (
-            "Search codebase using natural language queries. "
-            "When to use: Use this when the user asks about behavior or functionality but doesn't know file names or locations. "
+            "Perform a high-fidelity Hybrid Search combining Keyword (BM25) and Semantic Vector search with Jina Reranker v2. "
+            "Use this for complex architectural questions where exact matches aren't enough. Best for finding logic patterns, intent-based discovery, and deep context retrieval. "
             "Example: 'Where is authentication enforced?'"
         ),
         "inputSchema": {
@@ -104,8 +105,8 @@ _TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "search_similar",
         "description": (
-            "Find code snippets similar to a given file or function (code-to-code). "
-            "When to use: Use to locate related implementations or duplicates when you have an example snippet. "
+            "Identify Semantic Doppelgängers and structurally similar implementations across the codebase. Powered by Jina v2 embeddings to detect logic duplicates even if variable names differ. "
+            "Use this to maintain consistency or consolidate redundant logic. "
             "Example: 'Find functions similar to handlers/auth.py::login_handler'"
         ),
         "inputSchema": {
@@ -221,17 +222,17 @@ def get_mcp_tools(project_root: Optional[Path] = None, servers_tools: Optional[d
     If `project_root` is provided, only language tools for LSPs configured in
     `project_root/.mcp/mcp.json` -> `languageLsps` will be created. This ensures
     that only relevant language tools are advertised to the AI.
-    """
-    tools: List[Tool] = []
-
-    # Load project-level config from .mcp/mcp.json if available so server
-    # discovery functions can consult centralized settings (e.g. which
-    # directories to index, which python path LSPs should use, etc.). If the
-    # file is malformed, advertise a remediation tool but continue discovery.
-    project_cfg: Optional[dict] = None
-    if project_root:
-        try:
-            cfg_path = Path(project_root) / ".mcp" / "mcp.json"
+    {
+        "name": "analyze_impact",
+        "description": "CRITICAL for Refactoring. Trace the direct and transitive (ripple effect) dependency chain of any function or class using Graph-Based analysis. Use this BEFORE making any changes to see exactly which files and modules will break or require updates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol_name": {"type": "string"},
+                "max_depth": {"type": "integer", "default": 5},
+            },
+            "required": ["symbol_name"],
+        },
             if cfg_path.exists():
                 project_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         except Exception as e:

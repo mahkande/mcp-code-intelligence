@@ -245,6 +245,16 @@ def uninstall_mcp(
     """
     project_root = ctx.obj.get("project_root") or Path.cwd()
 
+    # Remove .mcp-code-intelligence directory in project root if exists
+    mcp_dir = project_root / ".mcp-code-intelligence"
+    import shutil
+    if mcp_dir.exists() and mcp_dir.is_dir():
+        try:
+            shutil.rmtree(mcp_dir)
+            print_success(f"  ✅ Removed project .mcp-code-intelligence directory: {mcp_dir}")
+        except Exception as e:
+            print_error(f"  ❌ Failed to remove .mcp-code-intelligence directory: {e}")
+
     console.print(
         Panel.fit(
             "[bold yellow]Removing MCP Integration[/bold yellow]\n"

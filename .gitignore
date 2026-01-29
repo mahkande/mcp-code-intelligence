@@ -121,3 +121,28 @@ tmp/
 temp/
 *.tmp
 *.temp
+
+# --- AI ve Test Otomasyon Dosyaları (GitHub'a gönderilmesin) ---
+# Tüm test çıktıları ve AI tarafından oluşturulan markdown dosyaları
+tests/manual/
+tests/sample_code/
+tests/integration/
+tests/e2e/
+tests/core/
+tests/unit/
+*.ai.md
+*.AI.md
+*_ai.md
+*_AI.md
+ai_*.md
+AI_*.md
+test_*.md
+*_test.md
+*.test.md
+*.Test.md
+*test*.md
+.changesets/*.md
+!/.changesets/README.md
+!/.changesets/template.md
+!/.changesets/EXAMPLE.md
+!/.changesets/IMPLEMENTATION_SUMMARY.md

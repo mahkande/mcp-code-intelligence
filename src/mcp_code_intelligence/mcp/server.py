@@ -1,8 +1,9 @@
-"""MCP server implementation for MCP Code Intelligence."""
+"""MCP server implementation with service-oriented architecture."""
 
 import asyncio
 import os
 import sys
+import json
 from pathlib import Path
 from typing import Any
 
@@ -24,49 +25,40 @@ from ..analysis import (
     SmellSeverity,
 )
 from ..config.thresholds import ThresholdConfig
-from ..core.database import ChromaVectorDatabase
-from ..core.embeddings import create_embedding_function
 from ..core.exceptions import ProjectNotFoundError
-from ..core.indexer import SemanticIndexer
 from ..core.project import ProjectManager
-from ..core.search import SemanticSearchEngine
-from ..core.watcher import FileWatcher
-from ..core.llm_client import LLMClient
-from ..core.config_utils import (
-    get_openai_api_key,
-    get_openrouter_api_key,
-    get_preferred_llm_provider,
-)
-from ..parsers.registry import ParserRegistry
 from ..core.lsp_proxy import get_manager, stop_proxies
 from ..core import formatters
+from ..parsers.registry import ParserRegistry
+
+# Import new services
+from .services import SessionService, RoutingService, ProtocolService
 
 
 class MCPVectorSearchServer:
-    """MCP server for vector search functionality."""
+    """MCP server for vector search - service-oriented architecture."""
 
     def __init__(
         self,
         project_root: Path | None = None,
         enable_file_watching: bool | None = None,
     ):
-        """Initialize the MCP server.
+        """Initialize MCP server with auto-detection and service wiring.
 
         Args:
-            project_root: Project root directory. If None, will auto-detect from:
-                         1. PROJECT_ROOT or MCP_PROJECT_ROOT environment variable
-                         2. Current working directory
-            enable_file_watching: Enable file watching for automatic reindexing.
-                                  If None, checks MCP_ENABLE_FILE_WATCHING env var (default: True).
+            project_root: Project root directory (auto-detected if None)
+            enable_file_watching: Enable file watching (from env var if None)
         """
-        # Auto-detect project root from environment or current directory
+        # --- Startup logging: env keys and interpreter ---
+        from mcp_vector_search.logger_config import logger
+        critical_envs = [k for k in os.environ if any(x in k for x in ["JINA", "OPENAI", "MCP", "API_KEY", "TOKEN"])]
+        masked = {k: (v[:2] + "****" if v else "****") for k, v in os.environ.items() if k in critical_envs}
+        logger.info(f"[Startup] Kritik env anahtarları: {masked}")
+        logger.info(f"[Startup] Aktif Python: {sys.executable}")
+
+        # Auto-detect project root
         if project_root is None:
-            # Priority 1: MCP_PROJECT_ROOT (new standard)
-            # Priority 2: PROJECT_ROOT (legacy)
-            # Priority 3: Current working directory
-            env_project_root = os.getenv("MCP_PROJECT_ROOT") or os.getenv(
-                "PROJECT_ROOT"
-            )
+            env_project_root = os.getenv("MCP_PROJECT_ROOT") or os.getenv("PROJECT_ROOT")
             if env_project_root:
                 project_root = Path(env_project_root).resolve()
                 logger.info(f"Using project root from environment: {project_root}")
@@ -77,197 +69,79 @@ class MCPVectorSearchServer:
         self.project_root = project_root
         self.project_manager = ProjectManager(self.project_root)
 
-        # Setup activity logging
-        self._setup_logging()
-
-        self.search_engine: SemanticSearchEngine | None = None
-        self.file_watcher: FileWatcher | None = None
-        self.indexer: SemanticIndexer | None = None
-        self.database: ChromaVectorDatabase | None = None
-        self.llm_client: LLMClient | None = None
-        self._initialized = False
-
-        # Determine if file watching should be enabled
+        # Determine file watching setting
         if enable_file_watching is None:
-            # Check environment variable, default to True
             env_value = os.getenv("MCP_ENABLE_FILE_WATCHING", "true").lower()
-            self.enable_file_watching = env_value in ("true", "1", "yes", "on")
-        else:
-            self.enable_file_watching = enable_file_watching
+            enable_file_watching = env_value in ("true", "1", "yes", "on")
 
-    def _setup_logging(self) -> None:
-        """Setup logging to file for background activity monitoring."""
+        # Wire services
+        self.session_service = SessionService(project_root, enable_file_watching)
+        self.routing_service = RoutingService()
+        self.protocol_service = ProtocolService()
+
+        # Register tool handlers
+        self._register_handlers()
+
+    def _register_handlers(self) -> None:
+        """Register all tool handlers with routing service."""
+        handlers = {
+            "search_code": self._search_code,
+            "search_similar": self._search_similar,
+            "search_context": self._search_context,
+            "get_project_status": self._get_project_status,
+            "index_project": self._index_project,
+            "analyze_project": self._analyze_project,
+            "analyze_file": self._analyze_file,
+            "find_smells": self._find_smells,
+            "get_complexity_hotspots": self._get_complexity_hotspots,
+            "check_circular_dependencies": self._check_circular_dependencies,
+            "find_symbol": self._find_symbol,
+            "get_relationships": self._get_relationships,
+            "interpret_analysis": self._interpret_analysis,
+            "find_duplicates": self._find_duplicates,
+            "silence_health_issue": self._silence_health_issue,
+            "propose_logic": self._handle_propose_logic,
+            "impact_analysis": self._impact_analysis,
+        }
+        for tool_name, handler in handlers.items():
+            self.routing_service.register_handler(tool_name, handler)
+
+    async def _impact_analysis(self, args: dict[str, Any]) -> CallToolResult:
+        """Handle impact_analysis tool call."""
+        symbol_name = args.get("symbol_name", "")
+        max_depth = args.get("max_depth", 5)
+        if not symbol_name:
+            return self.protocol_service.build_error_response("symbol_name parameter is required")
         try:
-            log_dir = self.project_root / ".mcp-code-intelligence" / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / "activity.log"
-
-            # Add file logger (keep last 5MB of logs, rotation)
-            logger.add(
-                log_file,
-                rotation="5 MB",
-                retention="1 week",
-                level="INFO",
-                format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"
-            )
-            logger.info("--- MCP Server Background Logging Started ---")
-            logger.info(f"Project Root: {self.project_root}")
-        except Exception as e:
-            # Fallback to stdout if file logging fails (shouldn't happen)
-            print(f"Warning: Could not setup file logging: {e}")
-
-    async def initialize(self) -> None:
-        """Initialize the search engine and database."""
-        if self._initialized:
-            return
-
-        try:
-            # Load project configuration
-            config = self.project_manager.load_config()
-
-            # Setup embedding function
-            embedding_function, _ = create_embedding_function(
-                model_name=config.embedding_model
-            )
-
-            # Setup database
-            self.database = ChromaVectorDatabase(
-                persist_directory=config.index_path,
-                embedding_function=embedding_function,
-            )
-
-            # Initialize database
-            await self.database.__aenter__()
-
-            # Check if index is empty and auto-index if needed
-            try:
-                collection = self.database.get_collection()
-                chunk_count = collection.count()
-
-                if chunk_count == 0:
-                    logger.info("Index is empty, starting automatic indexing...")
-                    # Import indexing functionality
-                    from ..cli.commands.index import run_indexing
-
-                    # Run indexing with conservative settings to prevent system freezes
-                    await run_indexing(
-                        project_root=self.project_root,
-                        force_reindex=False,
-                        show_progress=False,  # Disable progress for background indexing
-                        workers=None,  # Auto-detect
-                        throttle=0.5,  # Conservative throttling
-                        max_size=10240,  # 10MB max
-                        important_only=False,  # Index all files
-                    )
-                    logger.info(f"Automatic indexing completed: {collection.count()} chunks indexed")
-                else:
-                    logger.info(f"Index already contains {chunk_count} chunks")
-            except Exception as e:
-                logger.warning(f"Could not check/create index: {e}")
-                logger.info("You can manually run 'mcp-code-intelligence index' to create the index")
-
-            # Setup search engine
-            self.search_engine = SemanticSearchEngine(
-                database=self.database,
-                project_root=self.project_root,
-                reranker_model_name=config.reranker_model,
-            )
-
-            # Optionally create an LLM client and attach the search engine so server-side
-            # components can use context injection when making LLM calls. Only create
-            # the client if API keys are available in project config or environment.
-            try:
-                config_dir = self.project_root / ".mcp-code-intelligence"
-                openai_key = get_openai_api_key(config_dir)
-                openrouter_key = get_openrouter_api_key(config_dir)
-                preferred = get_preferred_llm_provider(config_dir)
-
-                if openai_key or openrouter_key:
-                    self.llm_client = LLMClient(
-                        openai_api_key=openai_key,
-                        openrouter_api_key=openrouter_key,
-                        provider=preferred if preferred in ("openai", "openrouter") else None,
-                    )
-                    # Attach search engine for context injection
-                    try:
-                        self.llm_client.search_engine = self.search_engine
-                    except Exception:
-                        pass
-                    logger.info("LLM client initialized and attached to search engine for context injection")
-                else:
-                    logger.debug("No LLM API keys found; skipping LLM client initialization in MCP server")
-            except Exception as e:
-                logger.warning(f"Failed to initialize LLM client in server: {e}")
-
-            # Initialize Guardian Manager for project health monitoring
-            from ..analysis.guardian import GuardianManager
-            self.guardian = GuardianManager(self.database, self.project_root)
-            self._enable_guardian = config.enable_guardian
-            self._enable_logic_check = config.enable_logic_check
-
-            # Setup indexer for file watching
-            if self.enable_file_watching:
-                self.indexer = SemanticIndexer(
-                    database=self.database,
-                    project_root=self.project_root,
-                    config=config,
-                )
-
-                # Setup file watcher
-                self.file_watcher = FileWatcher(
-                    project_root=self.project_root,
-                    config=config,
-                    indexer=self.indexer,
-                    database=self.database,
-                )
-
-                # Start file watching
-                await self.file_watcher.start()
-                logger.info("File watching enabled for automatic reindexing")
+            from ..core.relationships import analyze_impact
+            result = analyze_impact(self.project_root, symbol_name, max_depth)
+            if "error" in result:
+                return self.protocol_service.build_error_response(result["error"])
+            response_lines = [f"# Impact Analysis for '{symbol_name}'\n"]
+            response_lines.append(f"**Origin:** {result['origin']}")
+            response_lines.append(f"**Complexity Score:** {result['complexity_score']}")
+            response_lines.append("\n## Immediate Impact (Directly Affected Files):")
+            if result["immediate_impact"]:
+                for f in result["immediate_impact"]:
+                    response_lines.append(f"- {f}")
             else:
-                logger.info("File watching disabled")
-
-            self._initialized = True
-            logger.info(f"MCP server initialized for project: {self.project_root}")
-
-        except ProjectNotFoundError:
-            logger.error(f"Project not initialized at {self.project_root}")
-            raise
+                response_lines.append("- None")
+            response_lines.append("\n## Deep Impact (Transitive):")
+            if result["deep_impact"]:
+                for f in result["deep_impact"]:
+                    response_lines.append(f"- {f}")
+            else:
+                response_lines.append("- None")
+            return self.protocol_service.build_text_response("\n".join(response_lines))
         except Exception as e:
-            logger.error(f"Failed to initialize MCP server: {e}")
-            raise
-
-    async def cleanup(self) -> None:
-        """Cleanup resources."""
-        # Stop file watcher if running
-        if self.file_watcher and self.file_watcher.is_running:
-            logger.info("Stopping file watcher...")
-            await self.file_watcher.stop()
-            self.file_watcher = None
-
-        # Cleanup database connection
-        if self.database and hasattr(self.database, "__aexit__"):
-            await self.database.__aexit__(None, None, None)
-            self.database = None
-
-        # Clear references
-        self.search_engine = None
-        self.indexer = None
-        self._initialized = False
-        # Stop any running LSP proxies for this project
-        try:
-            await stop_proxies(self.project_root)
-        except Exception:
-            logger.debug("Failed to stop LSP proxies during cleanup")
-        logger.info("MCP server cleanup completed")
+            logger.error(f"Impact analysis failed: {e}")
+            return self.protocol_service.build_error_response(f"Impact analysis failed: {str(e)}")
 
     def get_tools(self) -> list[Tool]:
         """Get available MCP tools via central registry."""
         try:
             from ..core.tool_registry import get_mcp_tools
 
-            # Attempt to query local server classes for their advertised tools so
-            # the registry uses server-provided metadata as the primary source.
             servers_tools: dict = {}
             try:
                 from ..servers.filesystem_server import FilesystemServer
@@ -277,7 +151,6 @@ class MCPVectorSearchServer:
                     for t in fs.advertised_tools()
                 ]
             except Exception:
-                # If instantiation fails, skip filesystem server discovery
                 pass
 
             try:
@@ -288,7 +161,6 @@ class MCPVectorSearchServer:
                     for t in py.advertised_tools()
                 ]
             except Exception:
-                # Skip python lsp discovery on error
                 pass
 
             if servers_tools:
@@ -296,136 +168,43 @@ class MCPVectorSearchServer:
 
             return get_mcp_tools(self.project_root)
         except Exception:
-            # Fallback: empty list if registry unavailable
             return []
 
     def get_capabilities(self) -> ServerCapabilities:
         """Get server capabilities."""
         return ServerCapabilities(tools={"listChanged": True}, logging={})
 
+    # ========== Proxy Properties to SessionService ==========
+
+    @property
+    def _initialized(self) -> bool:
+        """Check if session is initialized."""
+        return self.session_service._initialized
+
+    @property
+    def search_engine(self):
+        """Get search engine from session service."""
+        return self.session_service.search_engine
+
+    async def initialize(self) -> None:
+        """Initialize server and session."""
+        await self.session_service.initialize()
+
     async def call_tool(self, request: CallToolRequest) -> CallToolResult:
-        """Handle tool calls."""
-        # Skip initialization for interpret_analysis (doesn't need project config)
-        if request.params.name != "interpret_analysis" and not self._initialized:
-            await self.initialize()
+        """Handle tool calls via routing service."""
+        # Initialize session if needed
+        if request.params.name != "interpret_analysis" and not self.session_service.is_initialized:
+            await self.session_service.initialize()
 
         try:
-            # Execute the actual tool
-            result: CallToolResult
-            if request.params.name == "search_code":
-                result = await self._search_code(request.params.arguments)
-            elif request.params.name == "search_similar":
-                result = await self._search_similar(request.params.arguments)
-            elif request.params.name == "search_context":
-                result = await self._search_context(request.params.arguments)
-            elif request.params.name == "get_project_status":
-                result = await self._get_project_status(request.params.arguments)
-            elif request.params.name == "index_project":
-                result = await self._index_project(request.params.arguments)
-            elif request.params.name == "analyze_project":
-                result = await self._analyze_project(request.params.arguments)
-            elif request.params.name == "analyze_file":
-                result = await self._analyze_file(request.params.arguments)
-            elif request.params.name == "find_smells":
-                result = await self._find_smells(request.params.arguments)
-            elif request.params.name == "get_complexity_hotspots":
-                result = await self._get_complexity_hotspots(request.params.arguments)
-            elif request.params.name == "check_circular_dependencies":
-                result = await self._check_circular_dependencies(request.params.arguments)
-            elif request.params.name == "find_symbol":
-                result = await self._find_symbol(request.params.arguments)
-            elif request.params.name == "get_relationships":
-                result = await self._get_relationships(request.params.arguments)
-            elif request.params.name == "interpret_analysis":
-                result = await self._interpret_analysis(request.params.arguments)
-            elif request.params.name == "find_duplicates":
-                from .duplicates_tool import handle_find_duplicates
-                result = await handle_find_duplicates(self.search_engine, request.params.arguments)
-            elif request.params.name == "silence_health_issue":
-                issue_id = request.params.arguments.get("issue_id")
-                success = await self.guardian.silence_issue(issue_id)
-                if success:
-                    result = CallToolResult(content=[TextContent(type="text", text=f"✅ Issue '{issue_id}' has been silenced. It will no longer appear in Guardian notices.")])
-                else:
-                    result = CallToolResult(content=[TextContent(type="text", text=f"ℹ️ Issue '{issue_id}' was already silenced or could not be found.")])
-            elif request.params.name == "propose_logic":
-                return await self._handle_propose_logic(request.params.arguments)
-            else:
-                # Check for language LSP proxy tools like "cpp_goto_definition"
-                import re
+            # Route to appropriate handler
+            result = await self.routing_service.route_tool_call(request)
 
-                m = re.match(r"(?P<lang>[a-z0-9_+-]+)_(?P<action>goto_definition|find_references|get_hover_info|get_completions)", request.params.name)
-                if m:
-                    lang = m.group("lang")
-                    action = m.group("action")
-
-                    # Map action to LSP method
-                    mapping = {
-                        "goto_definition": "textDocument/definition",
-                        "find_references": "textDocument/references",
-                        "get_hover_info": "textDocument/hover",
-                        "get_completions": "textDocument/completion",
-                    }
-
-                    method = mapping.get(action)
-                    args = request.params.arguments or {}
-                    file = args.get("file")
-                    line = args.get("line")
-                    character = args.get("character")
-
-                    if not file or line is None or character is None:
-                        return CallToolResult(content=[TextContent(type="text", text="Invalid arguments for LSP tool: require file,line,character")], isError=True)
-
-                    # Build LSP params
-                    params = {
-                        "textDocument": {"uri": f"file://{file}"},
-                        "position": {"line": line, "character": character},
-                    }
-
-                    manager = get_manager(self.project_root)
-                    try:
-                        if not manager.is_available(lang):
-                            return CallToolResult(content=[TextContent(type="text", text=f"LSP server for {lang} is not running. Please run setup or ensure the language server is installed and available.")], isError=True)
-
-                        res = await manager.request(lang, method, params)
-
-                        # Convert LSP response into clean MCP TextContent blocks
-                        try:
-                            if method == "textDocument/definition":
-                                content = formatters.format_definition_response(res)
-                            elif method == "textDocument/references":
-                                content = formatters.format_references_response(res)
-                            elif method == "textDocument/hover":
-                                content = formatters.format_hover_response(res)
-                            elif method == "textDocument/completion":
-                                content = formatters.format_completions_response(res, limit=10)
-                            else:
-                                # Fallback: stringify
-                                content = [TextContent(type="text", text=json.dumps(res))]
-
-                            return CallToolResult(content=content)
-                        except Exception as fe:
-                            return CallToolResult(content=formatters.format_lsp_error(fe), isError=True)
-                    except Exception as e:
-                        return CallToolResult(content=[TextContent(type="text", text=f"LSP proxy error: {e}")], isError=True)
-
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text", text=f"Unknown tool: {request.params.name}"
-                        )
-                    ],
-                    isError=True,
-                )
-
-            # --- GUARDIAN SMART NOTIFICATION INJECTION ---
-            # If the tool call was successful and it's a primary interaction tool, check for health notices
-            if self._enable_guardian and not result.isError and request.params.name in ("search_code", "search_similar", "get_project_status"):
+            # Inject Guardian health notice if enabled
+            if self.session_service._enable_guardian and not result.isError and request.params.name in ("search_code", "search_similar", "get_project_status"):
                 try:
-                    # Guardian check can be throttled or fast-scanned
-                    health_notice = await self.guardian.get_health_notice()
+                    health_notice = await self.session_service.guardian.get_health_notice()
                     if health_notice:
-                        # Prepend the notice to the response content
                         notice_content = TextContent(type="text", text=health_notice + "\n\n---\n")
                         result.content.insert(0, notice_content)
                 except Exception as g_err:
@@ -435,88 +214,113 @@ class MCPVectorSearchServer:
 
         except Exception as e:
             logger.error(f"Tool call failed: {e}")
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text=f"Tool execution failed: {str(e)}")
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response(f"Tool execution failed: {str(e)}")
+
+    async def cleanup(self) -> None:
+        """Cleanup resources through session service."""
+        await self.session_service.cleanup()
+
+    # ========== Tool Handlers ==========
 
     async def _search_code(self, args: dict[str, Any]) -> CallToolResult:
         """Handle search_code tool call."""
         query = args.get("query", "")
         limit = args.get("limit", 10)
         similarity_threshold = args.get("similarity_threshold", 0.3)
-        file_extensions = args.get("file_extensions")
-        language = args.get("language")
-        function_name = args.get("function_name")
-        class_name = args.get("class_name")
-        files = args.get("files")
 
         if not query:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Query parameter is required")],
-                isError=True,
+            return self.protocol_service.build_error_response("Query parameter is required")
+
+        if not self.session_service.search_engine:
+            return self.protocol_service.build_error_response("Search engine not initialized")
+
+        filters = self.protocol_service.build_search_filters(args)
+
+        try:
+            results = await self.session_service.search_engine.search(
+                query=query,
+                limit=limit,
+                similarity_threshold=similarity_threshold,
+                filters=filters,
             )
 
-        # Build filters
-        filters = {}
-        if file_extensions:
-            filters["file_extension"] = {"$in": file_extensions}
-        if language:
-            filters["language"] = language
-        if function_name:
-            filters["function_name"] = function_name
-        if class_name:
-            filters["class_name"] = class_name
-        if files:
-            # Convert file pattern to filter (simplified)
-            filters["file_pattern"] = files
+            if not results:
+                return self.protocol_service.build_text_response(f"No results found for query: '{query}'")
 
-        # Perform search
-        results = await self.search_engine.search(
-            query=query,
-            limit=limit,
-            similarity_threshold=similarity_threshold,
-            filters=filters,
-        )
-
-        # Format results
-        if not results:
-            response_text = f"No results found for query: '{query}'"
-        else:
             response_lines = [f"Found {len(results)} results for query: '{query}'\n"]
-
             for i, result in enumerate(results, 1):
-                response_lines.append(
-                    f"## Result {i} (Score: {result.similarity_score:.3f})"
-                )
-                response_lines.append(f"**File:** {result.file_path}")
-                if result.function_name:
-                    response_lines.append(f"**Function:** {result.function_name}")
-                if result.class_name:
-                    response_lines.append(f"**Class:** {result.class_name}")
-                response_lines.append(
-                    f"**Lines:** {result.start_line}-{result.end_line}"
-                )
-                response_lines.append("**Code:**")
-                response_lines.append("```" + (result.language or ""))
-                response_lines.append(result.content)
-                response_lines.append("```\n")
+                response_lines.extend(self.protocol_service.format_search_result(result, i))
 
-            response_text = "\n".join(response_lines)
+            return self.protocol_service.build_text_response("\n".join(response_lines))
 
-        return CallToolResult(content=[TextContent(type="text", text=response_text)])
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            return self.protocol_service.build_error_response(f"Search failed: {str(e)}")
+
+    async def _search_similar(self, args: dict[str, Any]) -> CallToolResult:
+        """Handle search_similar tool call."""
+        file_path_str = args.get("file_path", "")
+        if not file_path_str:
+            return self.protocol_service.build_error_response("file_path parameter is required")
+
+        file_path = self.protocol_service.resolve_file_path(file_path_str, self.project_root)
+        if not file_path:
+            return self.protocol_service.build_error_response(f"File not found: {file_path_str}")
+
+        try:
+            results = await self.session_service.search_engine.search_similar(
+                file_path=file_path,
+                function_name=args.get("function_name"),
+                limit=args.get("limit", 10),
+                similarity_threshold=args.get("similarity_threshold", 0.3),
+            )
+
+            if not results:
+                return self.protocol_service.build_text_response(f"No similar code found for {file_path_str}")
+
+            response_lines = [f"Found {len(results)} similar code snippets for {file_path_str}\n"]
+            for i, result in enumerate(results, 1):
+                response_lines.extend(self.protocol_service.format_search_result(result, i))
+
+            return self.protocol_service.build_text_response("\n".join(response_lines))
+
+        except Exception as e:
+            logger.error(f"Similar search failed: {e}")
+            return self.protocol_service.build_error_response(f"Similar search failed: {str(e)}")
+
+    async def _search_context(self, args: dict[str, Any]) -> CallToolResult:
+        """Handle search_context tool call."""
+        description = args.get("description", "")
+        if not description:
+            return self.protocol_service.build_error_response("description parameter is required")
+
+        try:
+            results = await self.session_service.search_engine.search_by_context(
+                context_description=description,
+                focus_areas=args.get("focus_areas"),
+                limit=args.get("limit", 10)
+            )
+
+            if not results:
+                return self.protocol_service.build_text_response(f"No contextually relevant code found for: {description}")
+
+            response_lines = [f"Found {len(results)} contextually relevant code snippets for: {description}\n"]
+            for i, result in enumerate(results, 1):
+                response_lines.extend(self.protocol_service.format_search_result(result, i))
+
+            return self.protocol_service.build_text_response("\n".join(response_lines))
+
+        except Exception as e:
+            logger.error(f"Context search failed: {e}")
+            return self.protocol_service.build_error_response(f"Context search failed: {str(e)}")
 
     async def _get_project_status(self, args: dict[str, Any]) -> CallToolResult:
         """Handle get_project_status tool call."""
         try:
             config = self.project_manager.load_config()
 
-            # Get database stats
-            if self.search_engine:
-                stats = await self.search_engine.database.get_stats()
-
+            if self.session_service.search_engine:
+                stats = await self.session_service.database.get_stats()
                 status_info = {
                     "project_root": str(config.project_root),
                     "index_path": str(config.index_path),
@@ -525,11 +329,7 @@ class MCPVectorSearchServer:
                     "languages": config.languages,
                     "total_chunks": stats.total_chunks,
                     "total_files": stats.total_files,
-                    "index_size": (
-                        f"{stats.index_size_mb:.2f} MB"
-                        if hasattr(stats, "index_size_mb")
-                        else "Unknown"
-                    ),
+                    "index_size": f"{stats.index_size_mb:.2f} MB" if hasattr(stats, "index_size_mb") else "Unknown",
                 }
             else:
                 status_info = {
@@ -544,9 +344,7 @@ class MCPVectorSearchServer:
             response_text = "# Project Status\n\n"
             response_text += f"**Project Root:** {status_info['project_root']}\n"
             response_text += f"**Index Path:** {status_info['index_path']}\n"
-            response_text += (
-                f"**File Extensions:** {', '.join(status_info['file_extensions'])}\n"
-            )
+            response_text += f"**File Extensions:** {', '.join(status_info['file_extensions'])}\n"
             response_text += f"**Embedding Model:** {status_info['embedding_model']}\n"
             response_text += f"**Languages:** {', '.join(status_info['languages'])}\n"
 
@@ -557,323 +355,131 @@ class MCPVectorSearchServer:
             else:
                 response_text += f"**Status:** {status_info['status']}\n"
 
-            return CallToolResult(
-                content=[TextContent(type="text", text=response_text)]
-            )
+            return self.protocol_service.build_text_response(response_text)
 
         except ProjectNotFoundError:
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"Project not initialized at {self.project_root}. Run 'mcp-code-intelligence init' first.",
-                    )
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response(f"Project not initialized at {self.project_root}")
+        except Exception as e:
+            logger.error(f"Project status failed: {e}")
+            return self.protocol_service.build_error_response(f"Project status failed: {str(e)}")
 
     async def _index_project(self, args: dict[str, Any]) -> CallToolResult:
         """Handle index_project tool call."""
-        force = args.get("force", False)
-        file_extensions = args.get("file_extensions")
-        workers = args.get("workers")
-        throttle = args.get("throttle")
-        max_size = args.get("max_size")
-        important_only = args.get("important_only")
-
         try:
-            # Import indexing functionality
-            from ..cli.commands.index import run_indexing
+            from ..cli.commands.index_runner import run_indexing
 
-            # Run indexing
             await run_indexing(
                 project_root=self.project_root,
-                force_reindex=force,
-                extensions=file_extensions,
-                show_progress=False,  # Disable progress for MCP
-                workers=workers,
-                throttle=throttle,
-                max_size=max_size,
-                important_only=important_only,
+                force_reindex=args.get("force", False),
+                extensions=args.get("file_extensions"),
+                show_progress=False,
+                workers=args.get("workers"),
+                throttle=args.get("throttle"),
+                max_size=args.get("max_size"),
+                important_only=args.get("important_only"),
             )
 
-            # Reinitialize search engine after indexing
             await self.cleanup()
-            await self.initialize()
+            await self.session_service.initialize()
 
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text", text="Project indexing completed successfully!"
-                    )
-                ]
-            )
+            return self.protocol_service.build_text_response("Project indexing completed successfully!")
 
         except Exception as e:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Indexing failed: {str(e)}")],
-                isError=True,
-            )
+            logger.error(f"Indexing failed: {e}")
+            return self.protocol_service.build_error_response(f"Indexing failed: {str(e)}")
 
     async def _find_symbol(self, args: dict[str, Any]) -> CallToolResult:
         """Handle find_symbol tool call."""
         name = args.get("name", "")
-        symbol_type = args.get("symbol_type")
-
         if not name:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Name parameter is required")],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response("Name parameter is required")
 
-        if not self.search_engine:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Search engine not initialized")],
-                isError=True,
-            )
+        if not self.session_service.search_engine:
+            return self.protocol_service.build_error_response("Search engine not initialized")
 
-        results = await self.search_engine.find_symbol(name, symbol_type)
+        try:
+            results = await self.session_service.search_engine.find_symbol(name, args.get("symbol_type"))
 
-        if not results:
-            response_text = f"Symbol '{name}' not found."
-        else:
+            if not results:
+                return self.protocol_service.build_text_response(f"Symbol '{name}' not found.")
+
             response_lines = [f"Found {len(results)} definitions for '{name}':\n"]
             for i, result in enumerate(results, 1):
-                response_lines.append(f"## Definition {i}")
-                response_lines.append(f"File: {result.file_path}")
-                response_lines.append(f"Lines: {result.start_line}-{result.end_line}")
-                response_lines.append(f"Type: {result.chunk_type}")
+                response_lines.extend([
+                    f"## Definition {i}",
+                    f"File: {result.file_path}",
+                    f"Lines: {result.start_line}-{result.end_line}",
+                    f"Type: {result.chunk_type}",
+                ])
                 if result.class_name:
                     response_lines.append(f"Class: {result.class_name}")
-                response_lines.append("\n```\n" + result.content + "\n```\n")
+                response_lines.extend(["\n```\n" + result.content + "\n```\n"])
 
-            response_text = "\n".join(response_lines)
+            return self.protocol_service.build_text_response("\n".join(response_lines))
 
-        return CallToolResult(content=[TextContent(type="text", text=response_text)])
+        except Exception as e:
+            logger.error(f"Find symbol failed: {e}")
+            return self.protocol_service.build_error_response(f"Find symbol failed: {str(e)}")
 
     async def _get_relationships(self, args: dict[str, Any]) -> CallToolResult:
         """Handle get_relationships tool call."""
         name = args.get("name", "")
-
         if not name:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Name parameter is required")],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response("Name parameter is required")
 
-        if not self.search_engine:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Search engine not initialized")],
-                isError=True,
-            )
-
-        data = await self.search_engine.get_symbol_relationships(name)
-
-        if "error" in data:
-            return CallToolResult(content=[TextContent(type="text", text=data["error"])])
-
-        response_lines = [f"# Relationships for '{name}'\n"]
-
-        # Definition
-        def_info = data["definition"]
-        response_lines.append("## Definition")
-        response_lines.append(f"- **File:** {def_info['file']}")
-        response_lines.append(f"- **Lines:** {def_info['lines']}")
-        response_lines.append(f"- **Type:** {def_info['type']}\n")
-
-        # Callers
-        response_lines.append("## Callers (Who calls this?)")
-        if not data["callers"]:
-            response_lines.append("- No external callers found.")
-        else:
-            for caller in data["callers"]:
-                response_lines.append(f"- `{caller['name']}` ({caller['file']})")
-        response_lines.append("")
-
-        # Callees
-        response_lines.append("## Callees (What does this call?)")
-        if not data["callees"]:
-            response_lines.append("- No internal calls found.")
-        else:
-            for callee in data["callees"]:
-                response_lines.append(f"- `{callee['name']}` ({callee['file']})")
-        response_lines.append("")
-
-        # Semantic Siblings
-        response_lines.append("## Semantic Siblings (Conceptually similar)")
-        if not data["semantic_siblings"]:
-            response_lines.append("- No similar patterns found.")
-        else:
-            for sibling in data["semantic_siblings"]:
-                response_lines.append(f"- `{sibling['name']}` ({sibling['file']}) [Score: {sibling['similarity']}]")
-
-        response_text = "\n".join(response_lines)
-        return CallToolResult(content=[TextContent(type="text", text=response_text)])
-
-    async def _search_similar(self, args: dict[str, Any]) -> CallToolResult:
-        """Handle search_similar tool call."""
-        file_path = args.get("file_path", "")
-        function_name = args.get("function_name")
-        limit = args.get("limit", 10)
-        similarity_threshold = args.get("similarity_threshold", 0.3)
-
-        if not file_path:
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text="file_path parameter is required")
-                ],
-                isError=True,
-            )
+        if not self.session_service.search_engine:
+            return self.protocol_service.build_error_response("Search engine not initialized")
 
         try:
-            from pathlib import Path
+            data = await self.session_service.search_engine.get_symbol_relationships(name)
 
-            # Convert to Path object
-            file_path_obj = Path(file_path)
-            if not file_path_obj.is_absolute():
-                file_path_obj = self.project_root / file_path_obj
+            if "error" in data:
+                return self.protocol_service.build_text_response(data["error"])
 
-            if not file_path_obj.exists():
-                return CallToolResult(
-                    content=[
-                        TextContent(type="text", text=f"File not found: {file_path}")
-                    ],
-                    isError=True,
-                )
+            response_lines = [f"# Relationships for '{name}'\n"]
 
-            # Run similar search
-            results = await self.search_engine.search_similar(
-                file_path=file_path_obj,
-                function_name=function_name,
-                limit=limit,
-                similarity_threshold=similarity_threshold,
-            )
+            def_info = data["definition"]
+            response_lines.extend([
+                "## Definition",
+                f"- **File:** {def_info['file']}",
+                f"- **Lines:** {def_info['lines']}",
+                f"- **Type:** {def_info['type']}\n",
+                "## Callers (Who calls this?)",
+            ])
 
-            # Format results
-            if not results:
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text", text=f"No similar code found for {file_path}"
-                        )
-                    ]
-                )
+            if not data["callers"]:
+                response_lines.append("- No external callers found.")
+            else:
+                for caller in data["callers"]:
+                    response_lines.append(f"- `{caller['name']}` ({caller['file']})")
 
-            response_lines = [
-                f"Found {len(results)} similar code snippets for {file_path}\n"
-            ]
+            response_lines.extend([
+                "",
+                "## Callees (What does this call?)",
+            ])
 
-            for i, result in enumerate(results, 1):
-                response_lines.append(
-                    f"## Result {i} (Score: {result.similarity_score:.3f})"
-                )
-                response_lines.append(f"**File:** {result.file_path}")
-                if result.function_name:
-                    response_lines.append(f"**Function:** {result.function_name}")
-                if result.class_name:
-                    response_lines.append(f"**Class:** {result.class_name}")
-                response_lines.append(
-                    f"**Lines:** {result.start_line}-{result.end_line}"
-                )
-                response_lines.append("**Code:**")
-                response_lines.append("```" + (result.language or ""))
-                # Show more of the content for similar search
-                content_preview = (
-                    result.content[:500]
-                    if len(result.content) > 500
-                    else result.content
-                )
-                response_lines.append(
-                    content_preview + ("..." if len(result.content) > 500 else "")
-                )
-                response_lines.append("```\n")
+            if not data["callees"]:
+                response_lines.append("- No internal calls found.")
+            else:
+                for callee in data["callees"]:
+                    response_lines.append(f"- `{callee['name']}` ({callee['file']})")
 
-            result_text = "\n".join(response_lines)
+            response_lines.extend([
+                "",
+                "## Semantic Siblings (Conceptually similar)",
+            ])
 
-            return CallToolResult(content=[TextContent(type="text", text=result_text)])
+            if not data["semantic_siblings"]:
+                response_lines.append("- No similar patterns found.")
+            else:
+                for sibling in data["semantic_siblings"]:
+                    response_lines.append(f"- `{sibling['name']}` ({sibling['file']}) [Score: {sibling['similarity']}]")
+
+            return self.protocol_service.build_text_response("\n".join(response_lines))
 
         except Exception as e:
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text=f"Similar search failed: {str(e)}")
-                ],
-                isError=True,
-            )
-
-    async def _search_context(self, args: dict[str, Any]) -> CallToolResult:
-        """Handle search_context tool call."""
-        description = args.get("description", "")
-        focus_areas = args.get("focus_areas")
-        limit = args.get("limit", 10)
-
-        if not description:
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text="description parameter is required")
-                ],
-                isError=True,
-            )
-
-        try:
-            # Perform context search
-            results = await self.search_engine.search_by_context(
-                context_description=description, focus_areas=focus_areas, limit=limit
-            )
-
-            # Format results
-            if not results:
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=f"No contextually relevant code found for: {description}",
-                        )
-                    ]
-                )
-
-            response_lines = [
-                f"Found {len(results)} contextually relevant code snippets"
-            ]
-            if focus_areas:
-                response_lines[0] += f" (focus: {', '.join(focus_areas)})"
-            response_lines[0] += f" for: {description}\n"
-
-            for i, result in enumerate(results, 1):
-                response_lines.append(
-                    f"## Result {i} (Score: {result.similarity_score:.3f})"
-                )
-                response_lines.append(f"**File:** {result.file_path}")
-                if result.function_name:
-                    response_lines.append(f"**Function:** {result.function_name}")
-                if result.class_name:
-                    response_lines.append(f"**Class:** {result.class_name}")
-                response_lines.append(
-                    f"**Lines:** {result.start_line}-{result.end_line}"
-                )
-                response_lines.append("**Code:**")
-                response_lines.append("```" + (result.language or ""))
-                # Show more of the content for context search
-                content_preview = (
-                    result.content[:500]
-                    if len(result.content) > 500
-                    else result.content
-                )
-                response_lines.append(
-                    content_preview + ("..." if len(result.content) > 500 else "")
-                )
-                response_lines.append("```\n")
-
-            result_text = "\n".join(response_lines)
-
-            return CallToolResult(content=[TextContent(type="text", text=result_text)])
-
-        except Exception as e:
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text=f"Context search failed: {str(e)}")
-                ],
-                isError=True,
-            )
+            logger.error(f"Get relationships failed: {e}")
+            return self.protocol_service.build_error_response(f"Get relationships failed: {str(e)}")
 
     async def _analyze_project(self, args: dict[str, Any]) -> CallToolResult:
         """Handle analyze_project tool call."""
@@ -881,29 +487,7 @@ class MCPVectorSearchServer:
         output_format = args.get("output_format", "summary")
 
         try:
-            # Load threshold configuration based on preset
-            threshold_config = self._get_threshold_config(threshold_preset)
-
-            # Run analysis using CLI analyze logic
             from ..cli.commands.analyze import _analyze_file, _find_analyzable_files
-
-            parser_registry = ParserRegistry()
-            files_to_analyze = _find_analyzable_files(
-                self.project_root, None, None, parser_registry, None
-            )
-
-            if not files_to_analyze:
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text="No analyzable files found in project",
-                        )
-                    ],
-                    isError=True,
-                )
-
-            # Analyze files
             from ..analysis import (
                 CognitiveComplexityCollector,
                 CyclomaticComplexityCollector,
@@ -911,6 +495,14 @@ class MCPVectorSearchServer:
                 NestingDepthCollector,
                 ParameterCountCollector,
             )
+
+            parser_registry = ParserRegistry()
+            files_to_analyze = _find_analyzable_files(
+                self.project_root, None, None, parser_registry, None
+            )
+
+            if not files_to_analyze:
+                return self.protocol_service.build_error_response("No analyzable files found in project")
 
             collectors = [
                 CognitiveComplexityCollector(),
@@ -924,47 +516,32 @@ class MCPVectorSearchServer:
 
             for file_path in files_to_analyze:
                 try:
-                    file_metrics = await _analyze_file(
-                        file_path, parser_registry, collectors
-                    )
+                    file_metrics = await _analyze_file(file_path, parser_registry, collectors)
                     if file_metrics and file_metrics.chunks:
                         project_metrics.files[str(file_path)] = file_metrics
-                except Exception as e:
-                    logger.debug(f"Failed to analyze {file_path}: {e}")
+                except Exception:
                     continue
 
             project_metrics.compute_aggregates()
 
-            # Detect code smells
-            smell_detector = SmellDetector(thresholds=threshold_config)
+            smell_detector = SmellDetector()
             all_smells = []
             for file_path, file_metrics in project_metrics.files.items():
                 file_smells = smell_detector.detect_all(file_metrics, file_path)
                 all_smells.extend(file_smells)
 
-            # Format response
             if output_format == "detailed":
-                # Return full JSON output
-                import json
-
                 output = project_metrics.to_summary()
                 output["smells"] = {
                     "total": len(all_smells),
                     "by_severity": {
-                        "error": sum(
-                            1 for s in all_smells if s.severity == SmellSeverity.ERROR
-                        ),
-                        "warning": sum(
-                            1 for s in all_smells if s.severity == SmellSeverity.WARNING
-                        ),
-                        "info": sum(
-                            1 for s in all_smells if s.severity == SmellSeverity.INFO
-                        ),
+                        "error": sum(1 for s in all_smells if s.severity == SmellSeverity.ERROR),
+                        "warning": sum(1 for s in all_smells if s.severity == SmellSeverity.WARNING),
+                        "info": sum(1 for s in all_smells if s.severity == SmellSeverity.INFO),
                     },
                 }
                 response_text = json.dumps(output, indent=2)
             else:
-                # Return summary
                 summary = project_metrics.to_summary()
                 response_lines = [
                     "# Project Analysis Summary\n",
@@ -980,62 +557,37 @@ class MCPVectorSearchServer:
                 for grade in ["A", "B", "C", "D", "F"]:
                     response_lines.append(f"- Grade {grade}: {dist[grade]} chunks")
 
-                response_lines.extend(
-                    [
-                        "\n## Health Metrics",
-                        f"- Average Health Score: {summary['health_metrics']['avg_health_score']:.2f}",
-                        f"- Files Needing Attention: {summary['health_metrics']['files_needing_attention']}",
-                        "\n## Code Smells",
-                        f"- Total: {len(all_smells)}",
-                        f"- Errors: {sum(1 for s in all_smells if s.severity == SmellSeverity.ERROR)}",
-                        f"- Warnings: {sum(1 for s in all_smells if s.severity == SmellSeverity.WARNING)}",
-                        f"- Info: {sum(1 for s in all_smells if s.severity == SmellSeverity.INFO)}",
-                    ]
-                )
+                response_lines.extend([
+                    "\n## Health Metrics",
+                    f"- Average Health Score: {summary['health_metrics']['avg_health_score']:.2f}",
+                    f"- Files Needing Attention: {summary['health_metrics']['files_needing_attention']}",
+                    "\n## Code Smells",
+                    f"- Total: {len(all_smells)}",
+                    f"- Errors: {sum(1 for s in all_smells if s.severity == SmellSeverity.ERROR)}",
+                    f"- Warnings: {sum(1 for s in all_smells if s.severity == SmellSeverity.WARNING)}",
+                    f"- Info: {sum(1 for s in all_smells if s.severity == SmellSeverity.INFO)}",
+                ])
 
                 response_text = "\n".join(response_lines)
 
-            return CallToolResult(
-                content=[TextContent(type="text", text=response_text)]
-            )
+            return self.protocol_service.build_text_response(response_text)
 
         except Exception as e:
             logger.error(f"Project analysis failed: {e}")
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text=f"Project analysis failed: {str(e)}")
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response(f"Project analysis failed: {str(e)}")
 
     async def _analyze_file(self, args: dict[str, Any]) -> CallToolResult:
         """Handle analyze_file tool call."""
         file_path_str = args.get("file_path", "")
-
         if not file_path_str:
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text="file_path parameter is required")
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response("file_path parameter is required")
+
+        file_path = self.protocol_service.resolve_file_path(file_path_str, self.project_root)
+        if not file_path:
+            return self.protocol_service.build_error_response(f"File not found: {file_path_str}")
 
         try:
-            file_path = Path(file_path_str)
-            if not file_path.is_absolute():
-                file_path = self.project_root / file_path
-
-            if not file_path.exists():
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text", text=f"File not found: {file_path_str}"
-                        )
-                    ],
-                    isError=True,
-                )
-
-            # Analyze single file
+            from ..cli.commands.analyze import _analyze_file
             from ..analysis import (
                 CognitiveComplexityCollector,
                 CyclomaticComplexityCollector,
@@ -1043,7 +595,6 @@ class MCPVectorSearchServer:
                 NestingDepthCollector,
                 ParameterCountCollector,
             )
-            from ..cli.commands.analyze import _analyze_file
 
             parser_registry = ParserRegistry()
             collectors = [
@@ -1057,21 +608,11 @@ class MCPVectorSearchServer:
             file_metrics = await _analyze_file(file_path, parser_registry, collectors)
 
             if not file_metrics:
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=f"Unable to analyze file: {file_path_str}",
-                        )
-                    ],
-                    isError=True,
-                )
+                return self.protocol_service.build_error_response(f"Unable to analyze file: {file_path_str}")
 
-            # Detect smells
             smell_detector = SmellDetector()
             smells = smell_detector.detect_all(file_metrics, str(file_path))
 
-            # Format response
             response_lines = [
                 f"# File Analysis: {file_path.name}\n",
                 f"**Path:** {file_path}",
@@ -1090,46 +631,31 @@ class MCPVectorSearchServer:
 
             if smells:
                 response_lines.append(f"## Code Smells ({len(smells)})\n")
-                for smell in smells[:10]:  # Show top 10
-                    response_lines.append(
-                        f"- [{smell.severity.value.upper()}] {smell.name}: {smell.description}"
-                    )
+                for smell in smells[:10]:
+                    response_lines.append(f"- [{smell.severity.value.upper()}] {smell.name}: {smell.description}")
                 if len(smells) > 10:
                     response_lines.append(f"\n... and {len(smells) - 10} more")
             else:
                 response_lines.append("## Code Smells\n- None detected")
 
-            response_text = "\n".join(response_lines)
-
-            return CallToolResult(
-                content=[TextContent(type="text", text=response_text)]
-            )
+            return self.protocol_service.build_text_response("\n".join(response_lines))
 
         except Exception as e:
             logger.error(f"File analysis failed: {e}")
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text=f"File analysis failed: {str(e)}")
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response(f"File analysis failed: {str(e)}")
 
     async def _find_smells(self, args: dict[str, Any]) -> CallToolResult:
         """Handle find_smells tool call."""
-        smell_type_filter = args.get("smell_type")
-        severity_filter = args.get("severity")
+        from ..cli.commands.analyze import _analyze_file, _find_analyzable_files
+        from ..analysis import (
+            CognitiveComplexityCollector,
+            CyclomaticComplexityCollector,
+            MethodCountCollector,
+            NestingDepthCollector,
+            ParameterCountCollector,
+        )
 
         try:
-            # Run full project analysis
-            from ..analysis import (
-                CognitiveComplexityCollector,
-                CyclomaticComplexityCollector,
-                MethodCountCollector,
-                NestingDepthCollector,
-                ParameterCountCollector,
-            )
-            from ..cli.commands.analyze import _analyze_file, _find_analyzable_files
-
             parser_registry = ParserRegistry()
             files_to_analyze = _find_analyzable_files(
                 self.project_root, None, None, parser_registry, None
@@ -1147,109 +673,70 @@ class MCPVectorSearchServer:
 
             for file_path in files_to_analyze:
                 try:
-                    file_metrics = await _analyze_file(
-                        file_path, parser_registry, collectors
-                    )
+                    file_metrics = await _analyze_file(file_path, parser_registry, collectors)
                     if file_metrics and file_metrics.chunks:
                         project_metrics.files[str(file_path)] = file_metrics
-                except Exception:  # nosec B112 - intentional skip of unparseable files
+                except Exception:
                     continue
 
-            # Detect all smells
             smell_detector = SmellDetector()
             all_smells = []
             for file_path, file_metrics in project_metrics.files.items():
                 file_smells = smell_detector.detect_all(file_metrics, file_path)
                 all_smells.extend(file_smells)
 
-            # Apply filters
+            smell_type_filter = args.get("smell_type")
+            severity_filter = args.get("severity")
+
             filtered_smells = all_smells
 
             if smell_type_filter:
-                filtered_smells = [
-                    s for s in filtered_smells if s.name == smell_type_filter
-                ]
+                filtered_smells = [s for s in filtered_smells if s.name == smell_type_filter]
 
             if severity_filter:
                 severity_enum = SmellSeverity(severity_filter)
-                filtered_smells = [
-                    s for s in filtered_smells if s.severity == severity_enum
-                ]
+                filtered_smells = [s for s in filtered_smells if s.severity == severity_enum]
 
-            # Format response
             if not filtered_smells:
-                filter_desc = []
-                if smell_type_filter:
-                    filter_desc.append(f"type={smell_type_filter}")
-                if severity_filter:
-                    filter_desc.append(f"severity={severity_filter}")
-                filter_str = f" ({', '.join(filter_desc)})" if filter_desc else ""
-                response_text = f"No code smells found{filter_str}"
-            else:
-                response_lines = [f"# Code Smells Found: {len(filtered_smells)}\n"]
+                return self.protocol_service.build_text_response("No code smells found")
 
-                # Group by severity
-                by_severity = {
-                    "error": [
-                        s for s in filtered_smells if s.severity == SmellSeverity.ERROR
-                    ],
-                    "warning": [
-                        s
-                        for s in filtered_smells
-                        if s.severity == SmellSeverity.WARNING
-                    ],
-                    "info": [
-                        s for s in filtered_smells if s.severity == SmellSeverity.INFO
-                    ],
-                }
+            response_lines = [f"# Code Smells Found: {len(filtered_smells)}\n"]
 
-                for severity_level in ["error", "warning", "info"]:
-                    smells = by_severity[severity_level]
-                    if smells:
-                        response_lines.append(
-                            f"## {severity_level.upper()} ({len(smells)})\n"
-                        )
-                        for smell in smells[:20]:  # Show top 20 per severity
-                            response_lines.append(
-                                f"- **{smell.name}** at `{smell.location}`"
-                            )
-                            response_lines.append(f"  {smell.description}")
-                            if smell.suggestion:
-                                response_lines.append(
-                                    f"  *Suggestion: {smell.suggestion}*"
-                                )
-                            response_lines.append("")
+            by_severity = {
+                "error": [s for s in filtered_smells if s.severity == SmellSeverity.ERROR],
+                "warning": [s for s in filtered_smells if s.severity == SmellSeverity.WARNING],
+                "info": [s for s in filtered_smells if s.severity == SmellSeverity.INFO],
+            }
 
-                response_text = "\n".join(response_lines)
+            for severity_level in ["error", "warning", "info"]:
+                smells = by_severity[severity_level]
+                if smells:
+                    response_lines.append(f"## {severity_level.upper()} ({len(smells)})\n")
+                    for smell in smells[:20]:
+                        response_lines.append(f"- **{smell.name}** at `{smell.location}`")
+                        response_lines.append(f"  {smell.description}")
+                        if smell.suggestion:
+                            response_lines.append(f"  *Suggestion: {smell.suggestion}*")
+                        response_lines.append("")
 
-            return CallToolResult(
-                content=[TextContent(type="text", text=response_text)]
-            )
+            return self.protocol_service.build_text_response("\n".join(response_lines))
 
         except Exception as e:
             logger.error(f"Smell detection failed: {e}")
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text=f"Smell detection failed: {str(e)}")
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response(f"Smell detection failed: {str(e)}")
 
     async def _get_complexity_hotspots(self, args: dict[str, Any]) -> CallToolResult:
         """Handle get_complexity_hotspots tool call."""
-        limit = args.get("limit", 10)
+        from ..cli.commands.analyze import _analyze_file, _find_analyzable_files
+        from ..analysis import (
+            CognitiveComplexityCollector,
+            CyclomaticComplexityCollector,
+            MethodCountCollector,
+            NestingDepthCollector,
+            ParameterCountCollector,
+        )
 
         try:
-            # Run full project analysis
-            from ..analysis import (
-                CognitiveComplexityCollector,
-                CyclomaticComplexityCollector,
-                MethodCountCollector,
-                NestingDepthCollector,
-                ParameterCountCollector,
-            )
-            from ..cli.commands.analyze import _analyze_file, _find_analyzable_files
-
             parser_registry = ParserRegistry()
             files_to_analyze = _find_analyzable_files(
                 self.project_root, None, None, parser_registry, None
@@ -1267,95 +754,59 @@ class MCPVectorSearchServer:
 
             for file_path in files_to_analyze:
                 try:
-                    file_metrics = await _analyze_file(
-                        file_path, parser_registry, collectors
-                    )
+                    file_metrics = await _analyze_file(file_path, parser_registry, collectors)
                     if file_metrics and file_metrics.chunks:
                         project_metrics.files[str(file_path)] = file_metrics
-                except Exception:  # nosec B112 - intentional skip of unparseable files
+                except Exception:
                     continue
 
-            # Get top N complex files
-            hotspots = project_metrics.get_hotspots(limit=limit)
+            hotspots = project_metrics.get_hotspots(limit=args.get("limit", 10))
 
-            # Format response
             if not hotspots:
-                response_text = "No complexity hotspots found"
-            else:
-                response_lines = [f"# Top {len(hotspots)} Complexity Hotspots\n"]
+                return self.protocol_service.build_text_response("No complexity hotspots found")
 
-                for i, file_metrics in enumerate(hotspots, 1):
-                    response_lines.extend(
-                        [
-                            f"## {i}. {Path(file_metrics.file_path).name}",
-                            f"**Path:** `{file_metrics.file_path}`",
-                            f"**Average Complexity:** {file_metrics.avg_complexity:.2f}",
-                            f"**Max Complexity:** {file_metrics.max_complexity}",
-                            f"**Total Complexity:** {file_metrics.total_complexity}",
-                            f"**Functions:** {file_metrics.function_count}",
-                            f"**Health Score:** {file_metrics.health_score:.2f}\n",
-                        ]
-                    )
+            response_lines = [f"# Top {len(hotspots)} Complexity Hotspots\n"]
 
-                response_text = "\n".join(response_lines)
+            for i, file_metrics in enumerate(hotspots, 1):
+                response_lines.extend([
+                    f"## {i}. {Path(file_metrics.file_path).name}",
+                    f"**Path:** `{file_metrics.file_path}`",
+                    f"**Average Complexity:** {file_metrics.avg_complexity:.2f}",
+                    f"**Max Complexity:** {file_metrics.max_complexity}",
+                    f"**Total Complexity:** {file_metrics.total_complexity}",
+                    f"**Functions:** {file_metrics.function_count}",
+                    f"**Health Score:** {file_metrics.health_score:.2f}\n",
+                ])
 
-            return CallToolResult(
-                content=[TextContent(type="text", text=response_text)]
-            )
+            return self.protocol_service.build_text_response("\n".join(response_lines))
 
         except Exception as e:
             logger.error(f"Hotspot detection failed: {e}")
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text=f"Hotspot detection failed: {str(e)}")
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response(f"Hotspot detection failed: {str(e)}")
 
-    async def _check_circular_dependencies(
-        self, args: dict[str, Any]
-    ) -> CallToolResult:
+    async def _check_circular_dependencies(self, args: dict[str, Any]) -> CallToolResult:
         """Handle check_circular_dependencies tool call."""
-        try:
-            # Find analyzable files to build import graph
-            from ..cli.commands.analyze import _find_analyzable_files
+        from ..cli.commands.analyze import _find_analyzable_files
+        from ..analysis.collectors.coupling import build_import_graph
 
+        try:
             parser_registry = ParserRegistry()
             files_to_analyze = _find_analyzable_files(
                 self.project_root, None, None, parser_registry, None
             )
 
             if not files_to_analyze:
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text="No analyzable files found in project",
-                        )
-                    ],
-                    isError=True,
-                )
+                return self.protocol_service.build_error_response("No analyzable files found in project")
 
-            # Import circular dependency detection
-            from ..analysis.collectors.coupling import build_import_graph
+            import_graph = build_import_graph(self.project_root, files_to_analyze, language="python")
 
-            # Build import graph for the project (reverse dependency graph)
-            import_graph = build_import_graph(
-                self.project_root, files_to_analyze, language="python"
-            )
-
-            # Convert to forward dependency graph for cycle detection
-            # import_graph maps: module -> set of files that import it (reverse)
-            # We need: file -> list of files it imports (forward)
             forward_graph: dict[str, list[str]] = {}
 
-            # Build forward graph by reading imports from files
             for file_path in files_to_analyze:
                 file_str = str(file_path.relative_to(self.project_root))
                 if file_str not in forward_graph:
                     forward_graph[file_str] = []
 
-                # For each module in import_graph, if this file imports it, add edge
                 for module, importers in import_graph.items():
                     for importer in importers:
                         importer_str = str(
@@ -1364,13 +815,11 @@ class MCPVectorSearchServer:
                             else importer
                         )
                         if importer_str == file_str:
-                            # This file imports the module, add forward edge
                             if module not in forward_graph[file_str]:
                                 forward_graph[file_str].append(module)
 
-            # Detect circular dependencies using DFS
             def find_cycles(graph: dict[str, list[str]]) -> list[list[str]]:
-                """Find all cycles in the import graph using DFS."""
+                """Find all cycles in import graph using DFS."""
                 cycles = []
                 visited = set()
                 rec_stack = set()
@@ -1384,15 +833,11 @@ class MCPVectorSearchServer:
                         if neighbor not in visited:
                             dfs(neighbor, path.copy())
                         elif neighbor in rec_stack:
-                            # Found a cycle
                             try:
                                 cycle_start = path.index(neighbor)
                                 cycle = path[cycle_start:] + [neighbor]
-                                # Normalize cycle representation to avoid duplicates
                                 cycle_tuple = tuple(sorted(cycle))
-                                if not any(
-                                    tuple(sorted(c)) == cycle_tuple for c in cycles
-                                ):
+                                if not any(tuple(sorted(c)) == cycle_tuple for c in cycles):
                                     cycles.append(cycle)
                             except ValueError:
                                 pass
@@ -1407,192 +852,131 @@ class MCPVectorSearchServer:
 
             cycles = find_cycles(forward_graph)
 
-            # Format response
             if not cycles:
-                response_text = "No circular dependencies detected"
-            else:
-                response_lines = [f"# Circular Dependencies Found: {len(cycles)}\n"]
+                return self.protocol_service.build_text_response("No circular dependencies detected")
 
-                for i, cycle in enumerate(cycles, 1):
-                    response_lines.append(f"## Cycle {i}")
-                    response_lines.append("```")
-                    for j, node in enumerate(cycle):
-                        if j < len(cycle) - 1:
-                            response_lines.append(f"{node}")
-                            response_lines.append("  ↓")
-                        else:
-                            response_lines.append(f"{node} (back to {cycle[0]})")
-                    response_lines.append("```\n")
+            response_lines = [f"# Circular Dependencies Found: {len(cycles)}\n"]
 
-                response_text = "\n".join(response_lines)
+            for i, cycle in enumerate(cycles, 1):
+                response_lines.append(f"## Cycle {i}")
+                response_lines.append("```")
+                for j, node in enumerate(cycle):
+                    if j < len(cycle) - 1:
+                        response_lines.extend([f"{node}", "  ↓"])
+                    else:
+                        response_lines.append(f"{node} (back to {cycle[0]})")
+                response_lines.append("```\n")
 
-            return CallToolResult(
-                content=[TextContent(type="text", text=response_text)]
-            )
+            return self.protocol_service.build_text_response("\n".join(response_lines))
 
         except Exception as e:
             logger.error(f"Circular dependency check failed: {e}")
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"Circular dependency check failed: {str(e)}",
-                    )
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response(f"Circular dependency check failed: {str(e)}")
 
     async def _interpret_analysis(self, args: dict[str, Any]) -> CallToolResult:
         """Handle interpret_analysis tool call."""
         analysis_json_str = args.get("analysis_json", "")
-        focus = args.get("focus", "summary")
-        verbosity = args.get("verbosity", "normal")
-
         if not analysis_json_str:
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text="analysis_json parameter is required")
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response("analysis_json parameter is required")
 
         try:
-            import json
-
             from ..analysis.interpretation import AnalysisInterpreter, LLMContextExport
 
-            # Parse JSON input
-            analysis_data = json.loads(analysis_json_str)
+            analysis_data = self.protocol_service.parse_json_safely(analysis_json_str)
+            if not analysis_data:
+                return self.protocol_service.build_error_response("Invalid JSON input")
 
-            # Convert to LLMContextExport
             export = LLMContextExport(**analysis_data)
-
-            # Create interpreter and generate interpretation
             interpreter = AnalysisInterpreter()
             interpretation = interpreter.interpret(
-                export, focus=focus, verbosity=verbosity
+                export,
+                focus=args.get("focus", "summary"),
+                verbosity=args.get("verbosity", "normal")
             )
 
-            return CallToolResult(
-                content=[TextContent(type="text", text=interpretation)]
-            )
+            return self.protocol_service.build_text_response(interpretation)
 
-        except json.JSONDecodeError as e:
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"Invalid JSON input: {str(e)}",
-                    )
-                ],
-                isError=True,
-            )
         except Exception as e:
             logger.error(f"Analysis interpretation failed: {e}")
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"Interpretation failed: {str(e)}",
-                    )
-                ],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response(f"Interpretation failed: {str(e)}")
 
-    def _get_threshold_config(self, preset: str) -> ThresholdConfig:
-        """Get threshold configuration based on preset.
+    async def _find_duplicates(self, args: dict[str, Any]) -> CallToolResult:
+        """Handle find_duplicates tool call."""
+        try:
+            from .duplicates_tool import handle_find_duplicates
+            return await handle_find_duplicates(self.session_service.search_engine, args)
+        except Exception as e:
+            logger.error(f"Find duplicates failed: {e}")
+            return self.protocol_service.build_error_response(f"Find duplicates failed: {str(e)}")
 
-        Args:
-            preset: Threshold preset ('strict', 'standard', or 'relaxed')
-
-        Returns:
-            ThresholdConfig instance
-        """
-        if preset == "strict":
-            # Stricter thresholds
-            config = ThresholdConfig()
-            config.complexity.cognitive_a = 3
-            config.complexity.cognitive_b = 7
-            config.complexity.cognitive_c = 15
-            config.complexity.cognitive_d = 20
-            config.smells.long_method_lines = 30
-            config.smells.high_complexity = 10
-            config.smells.too_many_parameters = 3
-            config.smells.deep_nesting_depth = 3
-            return config
-        elif preset == "relaxed":
-            # More relaxed thresholds
-            config = ThresholdConfig()
-            config.complexity.cognitive_a = 7
-            config.complexity.cognitive_b = 15
-            config.complexity.cognitive_c = 25
-            config.complexity.cognitive_d = 40
-            config.smells.long_method_lines = 75
-            config.smells.high_complexity = 20
-            config.smells.too_many_parameters = 7
-            config.smells.deep_nesting_depth = 5
-            return config
-        else:
-            # Standard (default)
-            return ThresholdConfig()
+    async def _silence_health_issue(self, args: dict[str, Any]) -> CallToolResult:
+        """Handle silence_health_issue tool call."""
+        issue_id = args.get("issue_id")
+        try:
+            success = await self.session_service.guardian.silence_issue(issue_id)
+            if success:
+                msg = f"✅ Issue '{issue_id}' has been silenced. It will no longer appear in Guardian notices."
+            else:
+                msg = f"ℹ️ Issue '{issue_id}' was already silenced or could not be found."
+            return self.protocol_service.build_text_response(msg)
+        except Exception as e:
+            logger.error(f"Silence health issue failed: {e}")
+            return self.protocol_service.build_error_response(f"Silence health issue failed: {str(e)}")
 
     async def _handle_propose_logic(self, args: dict[str, Any]) -> CallToolResult:
-        """Handle propose_logic tool call to prevent duplication."""
-        if not self._enable_logic_check:
-            return CallToolResult(
-                content=[TextContent(type="text", text="ℹ️ Logic Check feature is currently disabled in project configuration.")]
+        """Handle propose_logic tool call."""
+        if not self.session_service._enable_logic_check:
+            return self.protocol_service.build_text_response(
+                "ℹ️ Logic Check feature is currently disabled in project configuration."
             )
 
         intent = args.get("intent", "")
-        code_draft = args.get("code_draft")
-
         if not intent:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Intent is required.")],
-                isError=True,
-            )
+            return self.protocol_service.build_error_response("Intent is required.")
 
-        analysis = await self.guardian.check_intent_duplication(intent, code_draft)
+        try:
+            analysis = await self.session_service.guardian.check_intent_duplication(intent, args.get("code_draft"))
 
-        if not analysis["duplicate_found"]:
-            return CallToolResult(
-                content=[TextContent(type="text", text="✅ No similar logic found. You can proceed with the implementation.")]
-            )
+            if not analysis["duplicate_found"]:
+                return self.protocol_service.build_text_response(
+                    "✅ No similar logic found. You can proceed with the implementation."
+                )
 
-        # Format the Blocker Notice
-        response_lines = [
-            "### 🛑 STOP! LOGIC DUPLICATION DETECTED",
-            "\n> [!CAUTION]",
-            "> **Highly similar logic already exists in your codebase.**",
-            "> Implementing this again would create technical debt. Please use the existing implementation below:\n"
-        ]
+            response_lines = [
+                "### 🛑 STOP! LOGIC DUPLICATION DETECTED",
+                "\n> [!CAUTION]",
+                "> **Highly similar logic already exists in your codebase.**",
+                "> Implementing this again would create technical debt. Please use the existing implementation below:\n"
+            ]
 
-        for i, match in enumerate(analysis["matches"], 1):
-            func = match['function_name'] or "Global/Block"
-            response_lines.append(f"#### 🔍 Match {i} (Confidence: {match['score']:.2f})")
-            response_lines.append(f"- **File:** `{match['file_path']}`")
-            response_lines.append(f"- **Symbol:** `{func}`")
-            response_lines.append(f"- **Location:** `{match['location']}`")
-            response_lines.append("\n**Existing Code Snippet:**")
-            response_lines.append(f"```python\n{match['content'][:400]}...\n```\n")
+            for i, match in enumerate(analysis["matches"], 1):
+                func = match['function_name'] or "Global/Block"
+                response_lines.extend([
+                    f"#### 🔍 Match {i} (Confidence: {match['score']:.2f})",
+                    f"- **File:** `{match['file_path']}`",
+                    f"- **Symbol:** `{func}`",
+                    f"- **Location:** `{match['location']}`",
+                    "\n**Existing Code Snippet:**",
+                    f"```python\n{match['content'][:400]}...\n```\n",
+                ])
 
-        response_lines.append("\n---")
-        response_lines.append("> [!TIP]")
-        response_lines.append("> Instead of writing new code, please **import and reuse** the existing logic.")
+            response_lines.extend([
+                "\n---",
+                "> [!TIP]",
+                "> Instead of writing new code, please **import and reuse** the existing logic.",
+            ])
 
-        return CallToolResult(content=[TextContent(type="text", text="\n".join(response_lines))])
+            return self.protocol_service.build_text_response("\n".join(response_lines))
+
+        except Exception as e:
+            logger.error(f"Propose logic failed: {e}")
+            return self.protocol_service.build_error_response(f"Propose logic failed: {str(e)}")
 
 
 def create_mcp_server(
     project_root: Path | None = None, enable_file_watching: bool | None = None
 ) -> Server:
-    """Create and configure the MCP server.
-
-    Args:
-        project_root: Project root directory. If None, will auto-detect.
-        enable_file_watching: Enable file watching for automatic reindexing.
-                              If None, checks MCP_ENABLE_FILE_WATCHING env var (default: True).
-    """
+    """Create and configure the MCP server."""
     server = Server("mcp-code-intelligence")
     mcp_server = MCPVectorSearchServer(project_root, enable_file_watching)
 
@@ -1604,7 +988,6 @@ def create_mcp_server(
     @server.call_tool()
     async def handle_call_tool(name: str, arguments: dict | None):
         """Handle tool calls."""
-        # Create a mock request object for compatibility
         from types import SimpleNamespace
 
         mock_request = SimpleNamespace()
@@ -1613,29 +996,18 @@ def create_mcp_server(
         mock_request.params.arguments = arguments or {}
 
         result = await mcp_server.call_tool(mock_request)
-
-        # Return the content from the result
         return result.content
 
-    # Store reference for cleanup
     server._mcp_server = mcp_server
-
     return server
 
 
 async def run_mcp_server(
     project_root: Path | None = None, enable_file_watching: bool | None = None
 ) -> None:
-    """Run the MCP server using stdio transport.
-
-    Args:
-        project_root: Project root directory. If None, will auto-detect.
-        enable_file_watching: Enable file watching for automatic reindexing.
-                              If None, checks MCP_ENABLE_FILE_WATCHING env var (default: True).
-    """
+    """Run the MCP server using stdio transport."""
     server = create_mcp_server(project_root, enable_file_watching)
 
-    # Create initialization options with proper capabilities
     init_options = InitializationOptions(
         server_name="mcp-code-intelligence",
         server_version="0.4.0",
@@ -1651,17 +1023,14 @@ async def run_mcp_server(
         logger.error(f"MCP server error: {e}")
         raise
     finally:
-        # Cleanup
         if hasattr(server, "_mcp_server"):
             logger.info("Performing server cleanup...")
             await server._mcp_server.cleanup()
 
 
 if __name__ == "__main__":
-    # Allow specifying project root as command line argument
     project_root = Path(sys.argv[1]) if len(sys.argv) > 1 else None
 
-    # Check for file watching flag in command line args
     enable_file_watching = None
     if "--no-watch" in sys.argv:
         enable_file_watching = False
@@ -1671,5 +1040,3 @@ if __name__ == "__main__":
         sys.argv.remove("--watch")
 
     asyncio.run(run_mcp_server(project_root, enable_file_watching))
-
-

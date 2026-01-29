@@ -71,7 +71,7 @@ function validateEmail(email) {
         )
 
         # Index the project
-        from mcp_code_intelligence.cli.commands.index import run_indexing
+        from mcp_code_intelligence.cli.commands.index_runner import run_indexing
 
         await run_indexing(
             project_root=project_root, force_reindex=True, show_progress=False

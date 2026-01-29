@@ -267,6 +267,11 @@ class ChromaVectorDatabase(VectorDatabase, DatabaseRecoveryMixin):
                     "subproject_path": chunk.subproject_path or "",
                     # Incremental indexing
                     "content_hash": chunk.content_hash or "",
+                    # Contextual chunking fields
+                    "parent_context": chunk.parent_context or "",
+                    "breadcrumb": chunk.breadcrumb or "",
+                    "context_prefix": chunk.context_prefix or "",
+                    "nesting_level": chunk.nesting_level,
                 }
 
                 # Merge structural metrics if provided
@@ -459,6 +464,10 @@ class ChromaVectorDatabase(VectorDatabase, DatabaseRecoveryMixin):
                             code_smells=code_smells,
                             smell_count=metadata.get("smell_count"),
                             quality_score=quality_score,
+                            # Contextual chunking fields
+                            parent_context=metadata.get("parent_context"),
+                            breadcrumb=metadata.get("breadcrumb"),
+                            nesting_level=metadata.get("nesting_level", 0),
                         )
                         search_results.append(result)
 

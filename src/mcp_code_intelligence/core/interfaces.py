@@ -46,3 +46,18 @@ class ResilienceManager(Protocol):
         Should raise the original exception if retries exhausted and the
         error is non-recoverable.
         """
+
+
+@runtime_checkable
+class ContextService(Protocol):
+    """Provides file context enrichment and caching for search results."""
+
+    async def get_context(self, result: SearchResult, include_context: bool) -> SearchResult:
+        """Return an enhanced `SearchResult` with context_before/after and file_missing flags."""
+
+    def clear_cache(self) -> None:
+        """Clear any internal file caches held by the service."""
+
+    def get_cache_info(self) -> dict[str, Any]:
+        """Return cache statistics (hits, misses, size, maxsize, hit_rate)."""
+

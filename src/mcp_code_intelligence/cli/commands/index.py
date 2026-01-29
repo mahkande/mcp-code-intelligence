@@ -14,7 +14,21 @@ index_app = typer.Typer(help="Index codebase for semantic search", invoke_withou
 
 
 @index_app.callback(invoke_without_command=True)
-def main(ctx: typer.Context, **kwargs) -> None:
+def main(
+    ctx: typer.Context,
+    watch: bool = typer.Option(False, help="Watch for file changes and reindex live"),
+    incremental: bool = typer.Option(True, help="Incremental indexing (default: True)"),
+    extensions: str = typer.Option(None, help="Comma-separated list of file extensions to index"),
+    force_reindex: bool = typer.Option(False, help="Force full reindexing"),
+    batch_size: int = typer.Option(32, help="Batch size for indexing"),
+    show_progress: bool = typer.Option(True, help="Show progress bar"),
+    debug: bool = typer.Option(False, help="Enable debug output"),
+    skip_relationships: bool = typer.Option(False, help="Skip relationship indexing"),
+    workers: int = typer.Option(None, help="Number of worker processes"),
+    throttle: float = typer.Option(0.0, help="Throttle delay between batches"),
+    max_size: int = typer.Option(1024, help="Max file size in KB"),
+    important_only: bool = typer.Option(False, help="Index only important files"),
+) -> None:
     """Entrypoint for `mcp-code-intelligence index`.
 
     Delegates to `index_runner` or spawns a background indexer.
@@ -27,13 +41,37 @@ def main(ctx: typer.Context, **kwargs) -> None:
     from .index_background import _spawn_background_indexer
 
     project_root = (ctx.obj.get("project_root") if ctx.obj else None) or Path.cwd()
-    background = bool(kwargs.get("background", False))
+    background = False  # Optionally add a CLI flag if needed
 
     if background:
-        _spawn_background_indexer(project_root, **{k: kwargs.get(k) for k in ("force", "extensions", "workers", "throttle", "max_size", "important_only")})
+        _spawn_background_indexer(
+            project_root,
+            force=force_reindex,
+            extensions=extensions,
+            workers=workers,
+            throttle=throttle,
+            max_size=max_size,
+            important_only=important_only,
+        )
         return
 
-    asyncio.run(run_indexing(project_root=project_root, **kwargs))
+    asyncio.run(
+        run_indexing(
+            project_root=project_root,
+            watch=watch,
+            incremental=incremental,
+            extensions=extensions,
+            force_reindex=force_reindex,
+            batch_size=batch_size,
+            show_progress=show_progress,
+            debug=debug,
+            skip_relationships=skip_relationships,
+            workers=workers,
+            throttle=throttle,
+            max_size=max_size,
+            important_only=important_only,
+        )
+    )
 
 
 # Import submodules to register CLI subcommands (they import `index_app` from this file)

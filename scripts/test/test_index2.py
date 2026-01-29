@@ -12,11 +12,11 @@ with tempfile.TemporaryDirectory() as tmpdir:
     os.chdir("test_project")
 
     # Initialize first
-    result = runner.invoke(app, ["init", "main", "--extensions", ".py", "--force"])
+    result = runner.invoke(app, ["init", "--extensions", ".py", "--force"])
     print(f"Init exit code: {result.exit_code}")
 
     # Try to index
-    result = runner.invoke(app, ["index", "main"])
+    result = runner.invoke(app, ["index"])
 
     print(f"Index exit code: {result.exit_code}")
     print(f"Index output: {result.output[:500]}")

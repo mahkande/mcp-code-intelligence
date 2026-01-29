@@ -1,6 +1,6 @@
 """Data models for MCP Code Intelligence."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -44,8 +44,14 @@ class CodeChunk:
     # Enhancement 6: Incremental Indexing
     content_hash: str | None = None
 
+    # Enhancement 7: Contextual Chunking
+    parent_context: str | None = None  # "Class: User > Method: save_to_db"
+    breadcrumb: str | None = None  # Full structural path
+    context_prefix: str | None = None  # Injected comment prefix with context
+    nesting_level: int = 0  # How deeply nested in class/function hierarchy
+
     def __post_init__(self) -> None:
-        """Initialize default values and generate chunk ID."""
+        """Initialize default values and generate deterministic chunk ID."""
         if self.imports is None:
             self.imports = []
         if self.child_chunk_ids is None:
@@ -62,16 +68,18 @@ class CodeChunk:
             import hashlib
             self.content_hash = hashlib.md5(self.content.encode("utf-8")).hexdigest()
 
-        # Generate chunk ID if not provided
+        # Generate deterministic chunk ID if not provided
         if self.chunk_id is None:
-            import hashlib
-
-            # Include name and first 50 chars of content for uniqueness
-            # This ensures deterministic IDs while handling same-location chunks
-            name = self.function_name or self.class_name or ""
-            # We use the full content hash for ID generation now for better collision resistance
-            id_string = f"{self.file_path}:{self.chunk_type}:{name}:{self.start_line}:{self.end_line}:{self.content_hash[:8]}"
-            self.chunk_id = hashlib.sha256(id_string.encode()).hexdigest()[:16]
+            # Use file_path, qualified symbol name, and line range
+            if self.class_name and self.function_name:
+                qualified = f"{self.class_name}.{self.function_name}"
+            elif self.function_name:
+                qualified = self.function_name
+            elif self.class_name:
+                qualified = self.class_name
+            else:
+                qualified = ""
+            self.chunk_id = f"{self.file_path}::{qualified}:{self.start_line}-{self.end_line}"
 
     @property
     def id(self) -> str:
@@ -191,6 +199,20 @@ class SearchResult(BaseModel):
     symbol_context: str | None = Field(
         default="global",
         description="Symbol context: 'class', 'function' or 'global'",
+    )
+
+    # Contextual Chunking fields
+    parent_context: str | None = Field(
+        default=None,
+        description="Structural context (e.g., 'Class: User > Method: save_to_db')"
+    )
+    breadcrumb: str | None = Field(
+        default=None,
+        description="Full breadcrumb path including file and structural hierarchy"
+    )
+    nesting_level: int = Field(
+        default=0,
+        description="How deeply nested in class/function hierarchy (0=module level)"
     )
     navigation_hint: str | None = Field(
         default=None,

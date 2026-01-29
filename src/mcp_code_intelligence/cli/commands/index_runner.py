@@ -68,7 +68,7 @@ async def run_indexing(
 
     database = ChromaVectorDatabase(persist_directory=config.index_path, embedding_function=embedding_function)
 
-    indexer = SemanticIndexer(database=database, project_root=project_root, config=config, debug=debug)
+    indexer = SemanticIndexer(database=database, project_root=project_root, config=config)
 
     try:
         async with database:

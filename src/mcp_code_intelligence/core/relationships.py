@@ -413,64 +413,58 @@ class RelationshipStore:
     def _compute_caller_relationships(
         self, chunks: list[CodeChunk]
     ) -> dict[str, list[dict[str, Any]]]:
-        """Compute which chunks call which other chunks.
-
-        Args:
-            chunks: List of all code chunks
-
-        Returns:
-            Map of chunk_id -> list of caller info
-        """
+        """Compute which chunks call which other chunks, with fuzzy matching for qualified names."""
         caller_map = {}
-
         code_chunks = [
             c for c in chunks if c.chunk_type in ["function", "method", "class"]
         ]
-
         logger.debug(f"Processing {len(code_chunks)} code chunks for callers...")
-
         for chunk_idx, chunk in enumerate(code_chunks):
-            if chunk_idx % 50 == 0:  # Progress
+            if chunk_idx % 50 == 0:
                 logger.debug(f"Callers: {chunk_idx}/{len(code_chunks)} chunks")
-
             chunk_id = chunk.chunk_id or chunk.id
             file_path = str(chunk.file_path)
             function_name = chunk.function_name or chunk.class_name
-
+            qualified_name = None
+            if chunk.class_name and chunk.function_name:
+                qualified_name = f"{chunk.class_name}.{chunk.function_name}"
+            elif chunk.function_name:
+                qualified_name = chunk.function_name
+            elif chunk.class_name:
+                qualified_name = chunk.class_name
+            else:
+                qualified_name = None
             if not function_name:
                 continue
-
-            # Search other chunks that reference this function
             for other_chunk in chunks:
                 other_file_path = str(other_chunk.file_path)
-
-                # Only track EXTERNAL callers (different file)
                 if other_file_path == file_path:
                     continue
-
-                # Extract actual function calls using AST
                 actual_calls = extract_function_calls(other_chunk.content)
-
-                # Check if this function is actually called
+                # Fuzzy match: check both function_name and qualified_name
+                match_found = False
                 if function_name in actual_calls:
+                    match_found = True
+                elif qualified_name and qualified_name in actual_calls:
+                    match_found = True
+                if not match_found:
+                    # Try even more fuzzy: look for any call that endswith function_name
+                    for call in actual_calls:
+                        if call.endswith(f".{function_name}") or call == function_name:
+                            match_found = True
+                            break
+                if match_found:
                     other_chunk_id = other_chunk.chunk_id or other_chunk.id
-
-                    # Generate meaningful caller name
                     other_name = other_chunk.function_name or other_chunk.class_name
                     if not other_name:
                         other_name = extract_chunk_name(
                             other_chunk.content,
                             fallback=f"chunk_{other_chunk.start_line}",
                         )
-
-                    # Skip __init__ functions as callers (noise)
                     if other_name == "__init__":
                         continue
-
                     if chunk_id not in caller_map:
                         caller_map[chunk_id] = []
-
-                    # Store caller information
                     caller_map[chunk_id].append(
                         {
                             "file": other_file_path,
@@ -479,12 +473,10 @@ class RelationshipStore:
                             "type": other_chunk.chunk_type,
                         }
                     )
-
                     logger.debug(
                         f"Found call: {other_name} ({other_file_path}) -> "
-                        f"{function_name} ({file_path})"
+                        f"{qualified_name or function_name} ({file_path})"
                     )
-
         return caller_map
 
     def load(self) -> dict[str, Any]:
@@ -531,4 +523,74 @@ class RelationshipStore:
         if self.store_path.exists():
             self.store_path.unlink()
             logger.debug("Invalidated pre-computed relationships")
+
+def analyze_impact(project_root: Path, symbol_name: str, max_depth: int = 5) -> dict:
+    """Etki Analizi: Bir sembolün doğrudan ve zincirleme etkilerini bulur.
+    Args:
+        project_root: Proje kök dizini
+        symbol_name: Fonksiyon veya sınıf adı
+        max_depth: Zincir derinliği limiti
+    Returns:
+        {
+            'origin': ...,
+            'immediate_impact': [...],
+            'deep_impact': [...],
+            'complexity_score': ...,
+        }
+    """
+    store = RelationshipStore(project_root)
+    data = store.load()
+    # 1. Chunk id'yi bul
+    all_chunks = []
+    # chunks.json veya index dosyasından chunk'ları yükle (örnek: .mcp-code-intelligence/chunks.json)
+    chunks_path = project_root / ".mcp-code-intelligence" / "chunks.json"
+    if chunks_path.exists():
+        with open(chunks_path) as f:
+            all_chunks = json.load(f)
+    # Sembolü bul
+    target_chunks = [c for c in all_chunks if c.get("function_name") == symbol_name or c.get("class_name") == symbol_name]
+    if not target_chunks:
+        return {"error": f"Sembol bulunamadı: {symbol_name}"}
+    target_chunk = target_chunks[0]
+    chunk_id = target_chunk.get("chunk_id") or target_chunk.get("id")
+    origin = target_chunk.get("file_path")
+    # 2. Doğrudan etki (immediate impact): callers ve semantic outgoing
+    callers = data.get("callers", {}).get(chunk_id, [])
+    semantic_links = [l for l in data.get("semantic", []) if l.get("source") == chunk_id]
+    immediate_impact = set()
+    for c in callers:
+        immediate_impact.add(c["file"])
+    for l in semantic_links:
+        # semantic link target'ı bul
+        target = l.get("target")
+        for c in all_chunks:
+            if c.get("chunk_id") == target:
+                immediate_impact.add(c.get("file_path"))
+    # 3. Derin etki (deep impact): zincirleme traversal
+    deep_impact = set()
+    visited = set()
+    def traverse(cid, depth):
+        if depth > max_depth or cid in visited:
+            return
+        visited.add(cid)
+        # Callers
+        for c in data.get("callers", {}).get(cid, []):
+            deep_impact.add(c["file"])
+            traverse(c["chunk_id"], depth+1)
+        # Semantic outgoing
+        for l in [l for l in data.get("semantic", []) if l.get("source") == cid]:
+            target = l.get("target")
+            for c2 in all_chunks:
+                if c2.get("chunk_id") == target:
+                    deep_impact.add(c2.get("file_path"))
+                    traverse(target, depth+1)
+    traverse(chunk_id, 1)
+    # 4. Complexity score: kaç farklı chunk ve dosya etkileniyor?
+    complexity_score = len(immediate_impact) + len(deep_impact)
+    return {
+        "origin": origin,
+        "immediate_impact": list(immediate_impact),
+        "deep_impact": list(deep_impact),
+        "complexity_score": complexity_score,
+    }
 

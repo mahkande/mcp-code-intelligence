@@ -28,6 +28,7 @@ from .services.query_processor import DefaultQueryProcessor, QueryProcessorServi
 from .services.scoring import ScoringService
 from .services.discovery import DiscoveryService
 from .auto_indexer import AutoIndexer, SearchTriggeredIndexer
+from .bm25_index import BM25Index
 
 
 class SemanticSearchEngine:
@@ -70,6 +71,7 @@ class SemanticSearchEngine:
         )
         self.scoring_service = scoring_service or ScoringService(self.similarity_threshold)
         self.discovery_service = DiscoveryService(self)
+        self.bm25_index = BM25Index()  # Hybrid search index
 
         # Lightweight throttling
         self._last_health_check = 0.0
@@ -299,6 +301,68 @@ class SemanticSearchEngine:
             # Unexpected error - log and return safe fallback
             logger.error(f"Unexpected search error for query '{query}': {e}")
             return []
+
+    async def hybrid_search(
+        self,
+        query: str,
+        limit: int = 10,
+        filters: dict[str, Any] | None = None,
+        similarity_threshold: float | None = None,
+        include_context: bool = True,
+    ) -> list[SearchResult]:
+        """Hybrid search: vector + BM25 + RRF fusion + reranker."""
+        if not query.strip():
+            return []
+        processed_query = await self.query_processor.process(query)
+        # 1. Vektör araması
+        async def _db_search():
+            return await self.database.search(
+                query=processed_query,
+                limit=limit * 2,  # Daha fazla sonuç çek
+                filters=filters,
+                similarity_threshold=similarity_threshold or self.similarity_threshold,
+            )
+        vector_results = await self.resilience_manager.execute(_db_search, max_retries=3, jitter=0.2)
+        logger.debug(f"[HybridSearch] Vector sonuçları: {vector_results}")
+        # 2. BM25 araması
+        bm25_results = self.bm25_index.search(processed_query, top_k=limit * 2)
+        logger.debug(f"[HybridSearch] BM25 sonuçları: {bm25_results}")
+        # 3. RRF fusion
+        fused = self._reciprocal_rank_fusion(vector_results, bm25_results, limit)
+        # 4. Reranker
+        try:
+            reranked = await self.reranker_service.rerank(fused, query)
+        except Exception as e:
+            logger.warning(f"Reranker service failed, falling back to unranked results: {e}")
+            reranked = fused
+        return reranked
+
+    def _reciprocal_rank_fusion(self, vector_results, bm25_results, limit=10, k=60):
+        """Reciprocal Rank Fusion (RRF) for hybrid search result merging."""
+        # Map by unique chunk id (or file+lines fallback)
+        def get_id(res):
+            if hasattr(res, 'chunk_id') and res.chunk_id:
+                return res.chunk_id
+            if hasattr(res, 'file_path'):
+                return f"{res.file_path}:{getattr(res, 'start_line', 0)}:{getattr(res, 'end_line', 0)}"
+            if isinstance(res, dict):
+                return f"{res.get('file_path')}:{res.get('start_line', 0)}:{res.get('end_line', 0)}"
+            return str(res)
+        # Build rank dicts
+        vector_rank = {get_id(r): i for i, r in enumerate(vector_results)}
+        bm25_rank = {get_id(r): i for i, r in enumerate(bm25_results)}
+        all_ids = set(vector_rank) | set(bm25_rank)
+        fused_scores = {}
+        for cid in all_ids:
+            r1 = vector_rank.get(cid, 1e6)
+            r2 = bm25_rank.get(cid, 1e6)
+            fused_scores[cid] = 1/(k + r1) + 1/(k + r2)
+        # Sort by fused score
+        sorted_ids = sorted(fused_scores, key=lambda x: fused_scores[x], reverse=True)
+        # Build fused result list
+        id_to_obj = {**{get_id(r): r for r in vector_results}, **{get_id(r): r for r in bm25_results}}
+        fused = [id_to_obj[cid] for cid in sorted_ids[:limit]]
+        return fused
 
     # Delegate discovery helpers to DiscoveryService (keeps this module small)
 
