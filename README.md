@@ -1,8 +1,15 @@
+
 # 🚀 MCP Code Intelligence
 
-**Transform your AI Assistant (Claude, Cursor, Windsurf) into a Senior Developer who *actually* knows your codebase.**
+Stop Wasting Tokens. Start Coding Smarter.
 
-`mcp-code-intelligence` is a high-performance Model Context Protocol (MCP) server that provides **deep semantic understanding**, **smart navigation**, and **extreme token efficiency** using local vector embeddings (Jina v3) and Language Server Protocol (LSP) integration.
+Standard AI assistants are "token-hungry." When you ask a simple question, they often ingest thousands of lines of irrelevant code just to find a single reference, leading to massive token waste, high API costs, and slow responses.
+
+**mcp-code-intelligence** fixes this by moving the heavy lifting to your local machine:
+
+- **Precision Context:** Using Local Jina v3, we pinpoint only the exact code snippets needed. No more sending entire files to the cloud.
+- **Zero-Waste Analysis:** Our system filters out the "noise," reducing prompt sizes by up to 80%.
+- **Cost-Killer:** By providing the LLM with surgical precision instead of "brute-force" context, you save money on every single query while getting faster, more accurate answers.
 
 ---
 
