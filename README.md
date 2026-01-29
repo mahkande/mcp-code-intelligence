@@ -6,34 +6,44 @@
 
 ---
 
-## 💎 Why choose this over standard AI chat?
+## 💎 Why choose MCP Code Intelligence over standard AI chat?
 
-| Feature | Standard AI Chat | MCP Code Intelligence |
-| :--- | :--- | :--- |
-| **Context Window** | Fills up with redundant code | **Used only for critical logic** |
-| **Token Cost** | $$$ (sends whole files) | **$ (sends only relevant chunks)** |
-| **Understanding** | Path-based keywords | **Semantic/Meaning-based search** |
-| **Speed** | Slow file listing | **Instant symbol navigation** |
-| **Large Projects** | Chokes on 100+ files | **Prioritized indexing (Top-Down)** |
+<table>
+<tr><td>🔍 <b>search_code</b></td><td>Fast semantic code search using local Jina V3 vector engine. No token limits, instant results, context-aware (unlike standard AI chat's slow, token-limited grep).</td></tr>
+<tr><td>🧩 <b>search_similar</b></td><td>Detects duplicate or similar logic across your codebase, saving time and reducing technical debt.</td></tr>
+<tr><td>💬 <b>search_context</b></td><td>Finds code by natural language description, leveraging project embeddings for precise results.</td></tr>
+<tr><td>📊 <b>get_project_status</b></td><td>Instantly shows indexing, language, and health status—no manual inspection needed.</td></tr>
+<tr><td>⚡ <b>index_project</b></td><td>Local, parallel indexing for large codebases. Much faster than cloud-based AI parsing.</td></tr>
+<tr><td>🧠 <b>analyze_project / analyze_file</b></td><td>Deep analysis (complexity, health, code smells) with no token or context window limits. Results are project-wide and actionable.</td></tr>
+<tr><td>🚨 <b>find_smells</b></td><td>Pinpoints anti-patterns and code smells, improving code quality and maintainability.</td></tr>
+<tr><td>🔥 <b>get_complexity_hotspots</b></td><td>Highlights the most complex files/functions for targeted refactoring.</td></tr>
+<tr><td>🔗 <b>check_circular_dependencies</b></td><td>Detects hidden import cycles instantly—no need for manual graph analysis.</td></tr>
+<tr><td>🔎 <b>find_symbol / get_relationships</b></td><td>Symbol search and call graph mapping with full project context, not just open files.</td></tr>
+<tr><td>📝 <b>interpret_analysis</b></td><td>Summarizes analysis for human or AI consumption, enabling smarter decisions.</td></tr>
+<tr><td>🧬 <b>find_duplicates</b></td><td>Locates duplicate code blocks, reducing redundancy and improving maintainability.</td></tr>
+<tr><td>🔕 <b>silence_health_issue</b></td><td>Suppresses noisy warnings, keeping your workflow focused.</td></tr>
+<tr><td>🛑 <b>propose_logic</b></td><td>Prevents logic duplication before you code, saving tokens and review time.</td></tr>
+<tr><td>📈 <b>impact_analysis</b></td><td>Predicts the effect of changes before you refactor, avoiding costly mistakes.</td></tr>
+<tr><td>🛡️ <b>Guardian (health/logic checks)</b></td><td>Real-time health and duplication guard, ensuring codebase integrity.</td></tr>
+</table>
 
----
+**Token & Speed Benefits:**
+- All tools run locally, so there are no token limits or API rate restrictions.
+- Results are instant, even for large projects (thanks to vector search and parallel analysis).
+- No cloud latency—your data stays private and fast.
 
-## 📈 Token Efficiency & Cost Reduction
-
-Our **Smart Chunking** and **Semantic Retrieval** strategy dramatically reduces the amount of "noise" sent to the LLM (Claude/GPT-4).
-
-- **📉 60-80% Lower Token Usage:** Instead of sending 500 lines of a file, we send 2-3 relevant 20-line chunks.
-- **🧠 2x Smarter Context:** By using **Jina v3 embeddings** locally, the AI receives only the most semantically relevant code, leading to fewer hallucinations and more accurate bug fixes.
-- **⚡ Incremental Indexing:** MD5 fingerprinting ensures we only index what you change. Your CPU stays cool.
+**Quality & Context Benefits:**
+- Tools use your project's full graph and embeddings, not just file snippets.
+- Results are always relevant, actionable, and tailored to your codebase.
 
 ---
 
 ## ✨ Cutting-Edge Features
 
-- **🌍 Multi-Language Zeka (LSP Integration):**
+- **🌍 Multi-Language Intelligence (LSP Integration):**
   - **Python:** Full type intelligence via `python-lsp-server`.
   - **JS/TS:** Smart navigation via `typescript-language-server`.
-  - **Dart/Flutter:** Mobile development optimized zeka.
+  - **Dart/Flutter:** Mobile development optimized intelligence.
   - **Rust / Go / C++:** Fully supported high-performance LSPs.
 - **⚡ Smart Priority Indexing:** Large project? No problem. The system indexes your **Git changes**, **Entry Points**, and **READMEs** in the first 60 seconds, so you can start working while the rest finishes in the background.
 - **🏠 100% Local Intelligence:** All vector operations and embeddings stay on your machine. No code ever leaves your project.
