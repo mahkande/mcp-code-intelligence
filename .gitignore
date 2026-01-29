@@ -59,6 +59,28 @@ examples/
 tests/manual/
 tests/sample_code/
 
+# --- MCP Proje: Gereksiz Dosya ve Klasörler ---
+reports/
+scripts/
+logger_config.py
+analyze_architecture.py
+analyze_static.py
+MODERNIZATION_REPORT.md
+MCP_SERVER_MODERNIZATION_REPORT.md
+MODERNIZATION_VALIDATION_REPORT.md
+security_scan.py
+src/mcp_code_intelligence/core/bm25_index.py
+src/mcp_code_intelligence/core/services/context.py
+src/mcp_code_intelligence/core/services/discovery.py
+src/mcp_code_intelligence/core/services/metrics.py
+src/mcp_code_intelligence/core/services/parser.py
+src/mcp_code_intelligence/core/services/query_processor.py
+src/mcp_code_intelligence/core/services/scanner.py
+src/mcp_code_intelligence/core/services/scoring.py
+src/mcp_code_intelligence/mcp/server_old.py
+src/mcp_code_intelligence/mcp/services/protocol.py
+src/mcp_code_intelligence/mcp/services/router.py
+
 # --- Python ---
 __pycache__/
 *.py[cod]
