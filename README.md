@@ -83,18 +83,9 @@ cd mcp-code-intelligence
 # 3. Install the package (This makes the 'mcp-code-intelligence' command available everywhere)
 pip install .
 
-# 4. (VS Code users only) Install MCP-Compatible Extension
-# VS Code does not natively support MCP. Install Roo Code extension:
-# - Open VS Code Extensions (Ctrl+Shift+X)
-# - Search for "Roo Code" or "Cline"
-# - Install and activate the extension
-
-# 5. Initialize & Connect to your AI Editor
+# 4. Initialize & Connect to your AI Editor
 # Run this once. It auto-detects your editors and configures them.
 mcp-code-intelligence setup
-
-# For VS Code with Roo Code, also run:
-mcp-code-intelligence mcp roo-code
 ```
 
 The smart setup will:
@@ -103,7 +94,7 @@ The smart setup will:
 3.  **Prioritize** and index your codebase.
 4.  **Inject** configurations into your AI tools automatically.
 
-> **Important for VS Code users:** After running `setup`, make sure to also run `mcp-code-intelligence mcp roo-code` to configure Roo Code extension. Then restart VS Code to see MCP tools in action.
+
 
 ---
 
@@ -171,12 +162,12 @@ Kaldırma işlemi sonrası editörünüzü yeniden başlatmanız önerilir.
 - **Python 3.10+**
 - **Git** (for smart prioritization)
 - **Node.js** (Optional, for JS/TS LSP support)
-- **MCP-Compatible Editor Extension** (Required for VS Code users)
-  - **VS Code:** Install [Roo Code](https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude-dev) (formerly Cline) extension from VS Code Marketplace
-  - **Cursor:** Native MCP support (no extension needed)
-  - **Claude Desktop/Code:** Native MCP support (no extension needed)
+- **MCP-Code-Intelligence Extension** (Required for VS Code users)
+  - **VS Code:** This project includes a packaged extension folder `mcp-vscode-extension`.
+  - **Cursor:** Native MCP support.
+  - **Claude Desktop/Code:** Native MCP support.
   
-  > **Note:** VS Code does not natively support MCP (Model Context Protocol). You must install an MCP-compatible extension like Roo Code to use MCP Code Intelligence tools. Without such an extension, MCP tools will not be available in VS Code.
+  > **Note:** VS Code requires proper configuration in `settings.json` (Copilot Chat) or a helping extension to bridge context gaps. This repository provides a helper extension for this purpose.
 
 ---
 
