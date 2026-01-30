@@ -9,8 +9,12 @@ from .server import run_mcp_server
 
 def main():
     """Main entry point for the MCP server."""
-    # Allow specifying project root as command line argument
-    project_root = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+    # Priority: 1. Explicit Arg (if dir), 2. Env Var, 3. CWD
+    project_root = None
+    if len(sys.argv) > 1:
+        potential_path = Path(sys.argv[1])
+        if potential_path.is_dir():
+            project_root = potential_path
 
     try:
         asyncio.run(run_mcp_server(project_root))

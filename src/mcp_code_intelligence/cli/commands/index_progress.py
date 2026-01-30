@@ -28,10 +28,8 @@ async def _run_batch_indexing(
 
         # Pre-scan to get total file count
         console.print("[dim]Scanning for indexable files...[/dim]")
-        indexable_files, files_to_index = await indexer.get_files_to_index(
-            force_reindex=force_reindex
-        )
-        total_files = len(files_to_index)
+        indexable_files = indexer.get_files_to_index(force_reindex=force_reindex)
+        total_files = len(indexable_files)
 
         if total_files == 0:
             console.print("[yellow]No files need indexing[/yellow]")
@@ -58,7 +56,7 @@ async def _run_batch_indexing(
 
             with Live(progress, console=console, refresh_per_second=4) as live:
                 async for (file_path, chunks_added, success,) in indexer.index_files_with_progress(
-                    files_to_index, force_reindex
+                    indexable_files, force_reindex
                 ):
                     if success:
                         indexed_count += 1
@@ -74,7 +72,7 @@ async def _run_batch_indexing(
             # Try to update directory index
             try:
                 chunk_stats = {}
-                for file_path in files_to_index:
+                for file_path in indexable_files:
                     try:
                         mtime = os.path.getmtime(file_path)
                         chunk_stats[str(file_path)] = {"modified": mtime, "chunks": 1}
@@ -82,7 +80,7 @@ async def _run_batch_indexing(
                         pass
 
                 indexer.directory_index.rebuild_from_files(
-                    files_to_index, indexer.project_root, chunk_stats=chunk_stats
+                    indexable_files, indexer.project_root, chunk_stats=chunk_stats
                 )
                 indexer.directory_index.save()
             except Exception as e:

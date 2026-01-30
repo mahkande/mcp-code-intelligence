@@ -11,6 +11,7 @@ from typing import Optional, List
 
 from ..interfaces import RerankerService
 from ..models import SearchResult
+from loguru import logger
 
 
 
@@ -52,7 +53,6 @@ class LazyHFReRanker(RerankerService):
                 dev = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
                 self._device_str = dev
                 # Log device info at model load
-                from mcp_vector_search.logger_config import logger
                 logger.info(f"[JinaLocal] Model yükleniyor: {self.model_name} | Device: {dev.upper()} (torch.cuda.is_available={torch.cuda.is_available()})")
                 if hasattr(self._model, "to"):
                     try:
@@ -67,7 +67,6 @@ class LazyHFReRanker(RerankerService):
         if not HAS_TRANSFORMERS or not self.model_name:
             return results
 
-        from mcp_vector_search.logger_config import logger
         import time
 
         def _top3_log(res, label):

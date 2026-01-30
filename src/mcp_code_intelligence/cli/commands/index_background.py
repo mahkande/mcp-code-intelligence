@@ -301,7 +301,7 @@ class BackgroundIndexer:
                 # Get files to index
                 self._update_progress(status="scanning")
                 logger.info("Scanning for indexable files...")
-                indexable_files, files_to_index = await indexer.get_files_to_index(
+                files_to_index = indexer.get_files_to_index(
                     force_reindex=force_reindex
                 )
 

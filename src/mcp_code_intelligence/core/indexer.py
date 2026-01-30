@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from loguru import logger
 from packaging import version
+import time
 
 from .. import __version__
 from ..config.settings import ProjectConfig
@@ -164,7 +165,6 @@ class SemanticIndexer:
 
         indexed_count = 0
         failed_count = 0
-        import time
         heartbeat_interval = 60
         last_heartbeat = time.time()
 
@@ -190,7 +190,7 @@ class SemanticIndexer:
             batch_results = await self._process_file_batch(batch, force_reindex)
 
             # Count results
-            for success in batch_results:
+            for success, _ in batch_results:
                 if success:
                     indexed_count += 1
                 else:
@@ -280,22 +280,23 @@ class SemanticIndexer:
 
     async def _process_file_batch(
         self, file_paths: list[Path], force_reindex: bool = False
-    ) -> list[bool]:
+    ) -> list[tuple[bool, int]]:
         """Process a batch of files and accumulate chunks for batch embedding."""
         all_chunks: list[CodeChunk] = []
         all_metrics: dict[str, Any] = {}
-        success_flags: list[bool] = []
+        batch_results: list[tuple[bool, int]] = []
 
         metadata = self._load_index_metadata()
         for file_path in file_paths:
             if not self._should_index_file(file_path):
-                success_flags.append(True)
+                batch_results.append((True, 0))
                 continue
 
             await self.database.delete_by_file(file_path)
 
             try:
                 chunks = await self._parse_file(file_path)
+                chunk_count = len(chunks) if chunks else 0
                 if chunks:
                     chunks_with_hierarchy = self._build_chunk_hierarchy(chunks)
 
@@ -317,26 +318,26 @@ class SemanticIndexer:
                         all_metrics.update(chunk_metrics)
 
                     metadata[str(file_path)] = os.path.getmtime(file_path)
-                    success_flags.append(True)
+                    batch_results.append((True, chunk_count))
                 else:
                     metadata[str(file_path)] = os.path.getmtime(file_path)
-                    success_flags.append(True)
+                    batch_results.append((True, 0))
             except Exception as e:
                 logger.error(f"Failed to parse {file_path}: {e}")
-                success_flags.append(False)
+                batch_results.append((False, 0))
 
         # Single database insertion for entire batch
         if all_chunks:
             logger.info(f"Batch inserting {len(all_chunks)} chunks from {len(file_paths)} files")
             try:
                 await self.database.add_chunks(all_chunks, metrics=all_metrics)
-                logger.debug(f"Successfully indexed {len(all_chunks)} chunks from {sum(success_flags)} files")
+                logger.debug(f"Successfully indexed {len(all_chunks)} chunks")
             except Exception as e:
                 logger.error(f"Failed to insert batch of chunks: {e}")
-                return [False] * len(file_paths)
+                return [(False, 0)] * len(file_paths)
 
         self._save_index_metadata(metadata)
-        return success_flags
+        return batch_results
 
     def _load_index_metadata(self) -> dict[str, dict[str, Any]]:
         """Load file modification times and hashes from metadata file."""
@@ -536,8 +537,6 @@ class SemanticIndexer:
 
     def _find_indexable_files(self) -> list[Path]:
         """Find all files that should be indexed with caching."""
-        import time
-
         current_time = time.time()
         if (
             self._indexable_files_cache is not None
@@ -782,6 +781,53 @@ class SemanticIndexer:
         finally:
             self._restore_onnx_thread_limits(prev_env)
 
+    async def index_files_with_progress(
+        self, file_paths: list[Path], force_reindex: bool = False
+    ):
+        """Async generator that indexes files and yields progress for each file."""
+        for i in range(0, len(file_paths), self.batch_size):
+            batch = file_paths[i : i + self.batch_size]
+
+            # Process batch in parallel
+            batch_results = await self._process_file_batch(batch, force_reindex)
+
+            # Yield results for each file in the batch
+            for file_path, (success, chunks_added) in zip(batch, batch_results):
+                yield (file_path, chunks_added, success)
+
+            # Throttling to reduce system load
+            if self.throttle_delay > 0 and i + self.batch_size < len(file_paths):
+                await asyncio.sleep(self.throttle_delay)
+
+    def get_index_version(self) -> str:
+        """Get the current index version."""
+        if not self._index_metadata_file.exists():
+            return "unknown"
+            
+        try:
+            with open(self._index_metadata_file) as f:
+                data = json.load(f)
+                return data.get("index_version", "unknown")
+        except Exception:
+            return "unknown"
+
+    def needs_reindex_for_version(self) -> bool:
+        """Check if index should be rebuilt due to version change."""
+        version_str = self.get_index_version()
+        if version_str == "unknown":
+            return True
+        try:
+            from packaging import version
+            return version.parse(version_str) < version.parse(__version__)
+        except Exception:
+            return True
+
+    def get_ignore_patterns(self) -> list[str]:
+        """Get the list of ignore patterns used by the scanner."""
+        if hasattr(self.scanner_service, "_ignore_patterns"):
+            return self.scanner_service._ignore_patterns
+        return []
+
     async def get_indexing_stats(self, db_stats: IndexStats | None = None) -> dict:
         """Get statistics about the indexing process."""
         try:
@@ -807,3 +853,12 @@ class SemanticIndexer:
                 "total_files": 0,
                 "total_chunks": 0,
             }
+
+    def get_files_to_index(self, force_reindex: bool = False) -> list[Path]:
+        """Retrieve a list of files that actually need indexing."""
+        all_files = self._find_indexable_files()
+        if force_reindex:
+            return all_files
+
+        metadata = self._load_index_metadata()
+        return [f for f in all_files if self._needs_reindexing(f, metadata)]

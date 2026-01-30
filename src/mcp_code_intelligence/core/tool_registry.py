@@ -1,4 +1,3 @@
-"""
 """Central registry for tool metadata used by MCP servers and CLI chat.
 
 Provides a single source of truth for tool descriptions, schemas and LLM
@@ -11,6 +10,8 @@ import json
 from typing import Optional
 import importlib
 import re
+import time
+import os
 
 
 # Base tool definitions: name, human-friendly description, inputSchema
@@ -119,6 +120,73 @@ _TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["relative_path"],
         },
     },
+    {
+        "name": "get_project_status",
+        "description": "Get current project indexing status, configuration, and statistics. Use this to check if the project is fully indexed.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "analyze_project",
+        "description": "Perform a comprehensive sustainability and complexity analysis of the entire project. Detects technical debt hotspots and architectural issues.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "threshold_preset": {"type": "string", "enum": ["standard", "strict", "relaxed"], "default": "standard"},
+                "output_format": {"type": "string", "enum": ["summary", "detailed"], "default": "summary"},
+            },
+        },
+    },
+    {
+        "name": "index_project",
+        "description": "Force a re-indexing of the codebase. Use only if you suspect the index is stale or if many files changed externally.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "default": False},
+                "important_only": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "analyze_impact",
+        "description": "CRITICAL for Refactoring. Trace the direct and transitive (ripple effect) dependency chain of any function or class using Graph-Based analysis. Use this BEFORE making any changes to see exactly which files and modules will break or require updates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol_name": {"type": "string", "description": "The symbol to analyze impact for"},
+                "max_depth": {"type": "integer", "description": "Max transitive depth", "default": 5},
+            },
+            "required": ["symbol_name"],
+        },
+    },
+    {
+        "name": "find_symbol",
+        "description": "Find exact definitions of a symbol (class, function, variable) across the codebase. Backed by semantic search and static analysis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Symbol name to find"},
+                "symbol_type": {"type": "string", "description": "Optional type filter (class, function, etc.)"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "get_relationships",
+        "description": "Explore callers, callees, and semantic siblings of a symbol. Useful for understanding how components interact.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Symbol name to explore"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "debug_ping",
+        "description": "Returns registry source info for debugging. Call this to check if you are using the correct server.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -222,17 +290,13 @@ def get_mcp_tools(project_root: Optional[Path] = None, servers_tools: Optional[d
     If `project_root` is provided, only language tools for LSPs configured in
     `project_root/.mcp/mcp.json` -> `languageLsps` will be created. This ensures
     that only relevant language tools are advertised to the AI.
-    {
-        "name": "analyze_impact",
-        "description": "CRITICAL for Refactoring. Trace the direct and transitive (ripple effect) dependency chain of any function or class using Graph-Based analysis. Use this BEFORE making any changes to see exactly which files and modules will break or require updates.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "symbol_name": {"type": "string"},
-                "max_depth": {"type": "integer", "default": 5},
-            },
-            "required": ["symbol_name"],
-        },
+    """
+    tools: List[Tool] = []
+    project_cfg = {}
+
+    if project_root:
+        try:
+            cfg_path = Path(project_root) / ".mcp" / "mcp.json"
             if cfg_path.exists():
                 project_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         except Exception as e:
@@ -250,6 +314,15 @@ def get_mcp_tools(project_root: Optional[Path] = None, servers_tools: Optional[d
         # normalize any internal file path keys to `relative_path` for consistency
         schema = td.get("inputSchema", {})
         tools.append(Tool(name=td["name"], description=td["description"], inputSchema=schema))
+    
+    # DEBUG: Write promoted tools to a file
+    try:
+        debug_log = Path.cwd() / "tool_advert_debug.log"
+        with open(debug_log, "a", encoding="utf-8") as f:
+            f.write(f"[{time.ctime()}] (PID: {os.getpid()}) Registry source: {__file__}\n")
+            f.write(f"[{time.ctime()}] Advertised tools: {[t.name for t in tools]}\n")
+    except Exception:
+        pass
 
         # If no explicit servers_tools were provided, attempt lightweight discovery
         # by importing server modules and calling their `get_advertised_tools()`.

@@ -50,7 +50,6 @@ class MCPVectorSearchServer:
             enable_file_watching: Enable file watching (from env var if None)
         """
         # --- Startup logging: env keys and interpreter ---
-        from mcp_vector_search.logger_config import logger
         critical_envs = [k for k in os.environ if any(x in k for x in ["JINA", "OPENAI", "MCP", "API_KEY", "TOKEN"])]
         masked = {k: (v[:2] + "****" if v else "****") for k, v in os.environ.items() if k in critical_envs}
         logger.info(f"[Startup] Kritik env anahtarları: {masked}")
@@ -101,10 +100,24 @@ class MCPVectorSearchServer:
             "find_duplicates": self._find_duplicates,
             "silence_health_issue": self._silence_health_issue,
             "propose_logic": self._handle_propose_logic,
-            "impact_analysis": self._impact_analysis,
+            "analyze_impact": self._impact_analysis,
+            "debug_ping": self._handle_debug_ping,
         }
         for tool_name, handler in handlers.items():
             self.routing_service.register_handler(tool_name, handler)
+
+    async def _handle_debug_ping(self, args: dict) -> list:
+        import os
+        from ..core import tool_registry
+        msg = (
+            f"🏓 Pong! \n"
+            f"PID: {os.getpid()}\n"
+            f"Registry Source: {tool_registry.__file__}\n"
+            f"Package Root: {Path(__file__).parent.parent}\n"
+            f"Python: {sys.executable}"
+        )
+        logger.warning(f"🏓 [Ping] Debug info: {msg}")
+        return [self.protocol_service.build_text_response(msg)]
 
     async def _impact_analysis(self, args: dict[str, Any]) -> CallToolResult:
         """Handle impact_analysis tool call."""
@@ -113,6 +126,7 @@ class MCPVectorSearchServer:
         if not symbol_name:
             return self.protocol_service.build_error_response("symbol_name parameter is required")
         try:
+            logger.info(f"💥 [Impact] Analyzing ripple effect for symbol: '{symbol_name}' (Depth: {max_depth})")
             from ..core.relationships import analyze_impact
             result = analyze_impact(self.project_root, symbol_name, max_depth)
             if "error" in result:
@@ -192,6 +206,10 @@ class MCPVectorSearchServer:
 
     async def call_tool(self, request: CallToolRequest) -> CallToolResult:
         """Handle tool calls via routing service."""
+        name = request.params.name
+        args = request.params.arguments or {}
+        logger.info(f"🚀 [Tool Call] {name} matching activity... (Args: {args})")
+
         # Initialize session if needed
         if request.params.name != "interpret_analysis" and not self.session_service.is_initialized:
             await self.session_service.initialize()
@@ -199,6 +217,11 @@ class MCPVectorSearchServer:
         try:
             # Route to appropriate handler
             result = await self.routing_service.route_tool_call(request)
+            
+            if result.isError:
+                 logger.error(f"🔥 [Tool Error] {name} failed with error content.")
+            else:
+                 logger.success(f"✅ [Tool Success] {name} completed.")
 
             # Inject Guardian health notice if enabled
             if self.session_service._enable_guardian and not result.isError and request.params.name in ("search_code", "search_similar", "get_project_status"):
@@ -213,7 +236,7 @@ class MCPVectorSearchServer:
             return result
 
         except Exception as e:
-            logger.error(f"Tool call failed: {e}")
+            logger.error(f"Tool call exception: {e}")
             return self.protocol_service.build_error_response(f"Tool execution failed: {str(e)}")
 
     async def cleanup(self) -> None:
@@ -243,6 +266,8 @@ class MCPVectorSearchServer:
                 similarity_threshold=similarity_threshold,
                 filters=filters,
             )
+
+            logger.info(f"🔍 [Search] '{query}' query produced {len(results)} results")
 
             if not results:
                 return self.protocol_service.build_text_response(f"No results found for query: '{query}'")
@@ -274,6 +299,8 @@ class MCPVectorSearchServer:
                 limit=args.get("limit", 10),
                 similarity_threshold=args.get("similarity_threshold", 0.3),
             )
+
+            logger.info(f"👯 [Similar] Found {len(results)} snippets similar to {file_path.name}")
 
             if not results:
                 return self.protocol_service.build_text_response(f"No similar code found for {file_path_str}")
@@ -321,6 +348,7 @@ class MCPVectorSearchServer:
 
             if self.session_service.search_engine:
                 stats = await self.session_service.database.get_stats()
+                logger.info(f"📊 [Status] Project is ready. Index contains {stats.total_files} files.")
                 status_info = {
                     "project_root": str(config.project_root),
                     "index_path": str(config.index_path),
@@ -332,6 +360,7 @@ class MCPVectorSearchServer:
                     "index_size": f"{stats.index_size_mb:.2f} MB" if hasattr(stats, "index_size_mb") else "Unknown",
                 }
             else:
+                logger.info(f"📊 [Status] Project is not yet indexed.")
                 status_info = {
                     "project_root": str(config.project_root),
                     "index_path": str(config.index_path),
@@ -367,6 +396,8 @@ class MCPVectorSearchServer:
         """Handle index_project tool call."""
         try:
             from ..cli.commands.index_runner import run_indexing
+            
+            logger.info("🏗️  [Indexing] Starting background project indexing...")
 
             await run_indexing(
                 project_root=self.project_root,
@@ -381,6 +412,8 @@ class MCPVectorSearchServer:
 
             await self.cleanup()
             await self.session_service.initialize()
+            
+            logger.success("🏗️  [Indexing] Project indexing completed!")
 
             return self.protocol_service.build_text_response("Project indexing completed successfully!")
 
@@ -398,6 +431,7 @@ class MCPVectorSearchServer:
             return self.protocol_service.build_error_response("Search engine not initialized")
 
         try:
+            logger.info(f"🎯 [Symbol] Finding definition for '{name}' (Type: {args.get('symbol_type', 'Any')})")
             results = await self.session_service.search_engine.find_symbol(name, args.get("symbol_type"))
 
             if not results:
@@ -431,6 +465,7 @@ class MCPVectorSearchServer:
             return self.protocol_service.build_error_response("Search engine not initialized")
 
         try:
+            logger.info(f"🔗 [Relationships] Tracing connections for symbol: '{name}'")
             data = await self.session_service.search_engine.get_symbol_relationships(name)
 
             if "error" in data:
@@ -513,6 +548,8 @@ class MCPVectorSearchServer:
             ]
 
             project_metrics = ProjectMetrics(project_root=str(self.project_root))
+
+            logger.info(f"🧪 [Analysis] Analyzing {len(files_to_analyze)} files in project...")
 
             for file_path in files_to_analyze:
                 try:

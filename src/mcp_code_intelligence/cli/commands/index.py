@@ -8,6 +8,7 @@ work to the split modules in the same folder so each file stays under
 from pathlib import Path
 import asyncio
 import typer
+from .index_runner import run_indexing
 
 # CLI app for `mcp-code-intelligence index`
 index_app = typer.Typer(help="Index codebase for semantic search", invoke_without_command=True)

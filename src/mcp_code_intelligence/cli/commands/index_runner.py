@@ -75,6 +75,8 @@ async def run_indexing(
             if watch:
                 await _run_watch_mode(indexer, show_progress)
             else:
+                indexable_files = indexer.scanner_service.scan_files()
+                print_info(f"Indexable files: {len(indexable_files)}")
                 await _run_batch_indexing(indexer, force_reindex, show_progress, skip_relationships)
 
     except Exception as e:

@@ -8,6 +8,7 @@ from pathlib import Path
 from loguru import logger
 import typer
 from rich.console import Console
+from mcp_code_intelligence.core.languages import SUPPORTED_LANGUAGES as available_lsps
 
 from .discovery import DiscoveryManager
 from .intelligence import IntelligenceManager
@@ -118,13 +119,27 @@ async def run_setup_workflow(ctx: typer.Context, force: bool, verbose: bool):
             planned_lsp.append(data['name'])
             logger.debug(f"Matched language config: {data['name']} for selected: {selected_langs}")
 
-    # Prepare servers
     python_cmd = sys.executable
+    # Determine command for main server
+    import shutil
+    mcp_cmd = shutil.which("mcp-code-intelligence")
+    if mcp_cmd:
+        # Use the installed CLI command which is cleaner and more portable
+        server_cmd = "mcp-code-intelligence"
+        server_args = ["mcp"]
+    else:
+        # Fallback to python module execution
+        server_cmd = sys.executable
+        server_args = ["-m", "mcp_code_intelligence.mcp"]
+
     mcp_servers = {
         "mcp-code-intelligence": {
-            "command": python_cmd,
-            "args": ["-m", "mcp_code_intelligence.mcp", "mcp"],
-            "env": {"MCP_PROJECT_ROOT": str(project_root.resolve()), "MCP_ENABLE_FILE_WATCHING": "true"}
+            "command": server_cmd,
+            "args": server_args,
+            "env": {
+                "MCP_PROJECT_ROOT": str(project_root.resolve()),
+                "MCP_ENABLE_FILE_WATCHING": "true",
+            }
         },
         "filesystem": {
             "command": python_cmd,
@@ -201,6 +216,28 @@ async def run_setup_workflow(ctx: typer.Context, force: bool, verbose: bool):
     print_info("\n🔗 Linking AI tools...")
     mcp_man.write_local_config(mcp_servers, available_lsps)
     mcp_man.inject_global_config(configurable, mcp_servers)
+
+    # Universal Rule Injection (All AI assistants)
+    mcp_man.inject_universal_rules(mcp_servers)
+
+    # Google IDX / VS Code / Cursor specific injection
+    is_idx = discovery.is_idx()
+    is_vscode = discovery.is_vscode()
+    
+    if is_idx:
+        print_info("   Detected Google IDX environment")
+        mcp_man.inject_vscode_settings(mcp_servers)
+        mcp_man.inject_cursor_rules(mcp_servers)
+        mcp_man.inject_copilot_instructions(mcp_servers)
+    elif is_vscode:
+        print_info("   Detected VS Code / GitHub Copilot environment")
+        mcp_man.inject_vscode_settings(mcp_servers)
+        mcp_man.inject_cursor_rules(mcp_servers) # Still inject cursorrules as some users use Cursor with .vscode
+        mcp_man.inject_copilot_instructions(mcp_servers)
+    else:
+        # Generic project, still inject rules for potential AI usage
+        mcp_man.inject_cursor_rules(mcp_servers)
+        mcp_man.inject_copilot_instructions(mcp_servers)
 
     # Start LSP proxies for any available external LSPs so MCP can route requests
     try:

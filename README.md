@@ -60,14 +60,15 @@
 Get up and running in any project in under a minute:
 
 ```bash
-# 1. Clone the repository
+# 1. Clone the repository to your local machine
 git clone https://github.com/mahkande/mcp-code-intelligence.git
 cd mcp-code-intelligence
 
-# 2. Install the package locally (Editable mode)
-pip install -e .
+# 2. Install the package (This makes the 'mcp-code-intelligence' command available everywhere)
+pip install .
 
-# 3. Run the smart setup wizard
+# 3. Initialize & Connect to your AI Editor
+# Run this once. It auto-detects your editors (VS Code, Cursor, Claude) and configures them.
 mcp-code-intelligence setup
 ```
 
