@@ -108,12 +108,7 @@ SUPPORTED_TOOLS = {
         "format": "json",
         "description": "Google Gemini CLI",
     },
-    "roo-code": {
-        "name": "Roo Code",
-        "config_path": "dynamic",  # Path is OS-dependent
-        "format": "json",
-        "description": "Roo Code (VS Code Extension)",
-    },
+
 }
 
 
@@ -324,10 +319,7 @@ def configure_tool_mcp(
             return configure_gemini_mcp(
                 config_path, project_root, server_name, enable_file_watching, force
             )
-        elif tool_name == "roo-code":
-             return configure_roo_code_mcp(
-                project_root, server_name, enable_file_watching, force
-             )
+
         else:
             print_error(f"Configuration for {tool_name} not implemented yet")
             return False
@@ -532,82 +524,7 @@ def configure_gemini_mcp(
     return True
 
 
-def configure_roo_code_mcp(
-    project_root: Path,
-    server_name: str,
-    enable_file_watching: bool,
-    force: bool,
-) -> bool:
-    """Configure Roo Code (VS Code) MCP integration."""
-    import platform
-    
-    # Determine config path based on OS
-    system = platform.system()
-    if system == "Windows":
-        config_path = Path(os.environ["APPDATA"]) / "Code" / "User" / "globalStorage" / "saoudrizwan.claude-dev" / "settings" / "cline_mcp_settings.json"
-    elif system == "Darwin": # MacOS
-        config_path = Path.home() / "Library" / "Application Support" / "Code" / "User" / "globalStorage" / "saoudrizwan.claude-dev" / "settings" / "cline_mcp_settings.json"
-    else: # Linux
-        config_path = Path.home() / ".config" / "Code" / "User" / "globalStorage" / "saoudrizwan.claude-dev" / "settings" / "cline_mcp_settings.json"
 
-    # Create backup if file exists
-    if config_path.exists():
-        backup_path = config_path.with_suffix(config_path.suffix + ".backup")
-        shutil.copy2(config_path, backup_path)
-        
-        if not force:
-            try:
-                with open(config_path) as f:
-                    config = json.load(f)
-                if config.get("mcpServers", {}).get(server_name):
-                    print_warning(f"MCP server '{server_name}' already exists in Roo Code config")
-                    print_info("Use --force to overwrite")
-                    return False
-            except Exception:
-                pass # Proceed if corrupt or unreadable
-    else:
-        # Create directory structure if needed
-        try:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            config = {"mcpServers": {}}
-        except Exception as e:
-            print_error(f"Could not create Roo Code config directory: {e}")
-            return False
-
-    # Load existing or new config
-    try:
-        if config_path.exists():
-            with open(config_path) as f:
-                config = json.load(f)
-    except Exception:
-        config = {"mcpServers": {}}
-        
-    if "mcpServers" not in config:
-        config["mcpServers"] = {}
-
-    # Get python command
-    command, args = detect_install_method()
-    
-    # Roo Code Specific structure
-    config["mcpServers"][server_name] = {
-        "command": command,
-        "args": args,
-        "env": {
-            "MCP_PROJECT_ROOT": str(project_root.absolute()),
-            "MCP_ENABLE_FILE_WATCHING": "true" if enable_file_watching else "false"
-        },
-        "disabled": False,
-        "autoApprove": []
-    }
-
-    try:
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
-        print_success(f"✅ Configured Roo Code at {config_path}")
-        return True
-    except Exception as e:
-        print_error(f"Failed to write Roo Code config: {e}")
-        return False
 
 
 

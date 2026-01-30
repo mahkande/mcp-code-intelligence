@@ -124,9 +124,8 @@ async def run_setup_workflow(ctx: typer.Context, force: bool, verbose: bool):
     import shutil
     mcp_cmd = shutil.which("mcp-code-intelligence")
     if mcp_cmd:
-        # Use the absolute path to the CLI command to support virtual environments
-        # (If we just used "mcp-code-intelligence", it wouldn't work if the venv isn't active in the editor)
-        server_cmd = mcp_cmd
+        # Use the installed CLI command which is cleaner and more portable
+        server_cmd = "mcp-code-intelligence"
         server_args = ["mcp"]
     else:
         # Fallback to python module execution
@@ -219,10 +218,26 @@ async def run_setup_workflow(ctx: typer.Context, force: bool, verbose: bool):
     mcp_man.inject_global_config(configurable, mcp_servers)
 
     # Universal Rule Injection (All AI assistants)
-    # Rules files are always created regardless of editor type
     mcp_man.inject_universal_rules(mcp_servers)
-    mcp_man.inject_cursor_rules(mcp_servers)
-    mcp_man.inject_copilot_instructions(mcp_servers)
+
+    # Google IDX / VS Code / Cursor specific injection
+    is_idx = discovery.is_idx()
+    is_vscode = discovery.is_vscode()
+    
+    if is_idx:
+        print_info("   Detected Google IDX environment")
+        mcp_man.inject_vscode_settings(mcp_servers)
+        mcp_man.inject_cursor_rules(mcp_servers)
+        mcp_man.inject_copilot_instructions(mcp_servers)
+    elif is_vscode:
+        print_info("   Detected VS Code / GitHub Copilot environment")
+        mcp_man.inject_vscode_settings(mcp_servers)
+        mcp_man.inject_cursor_rules(mcp_servers) # Still inject cursorrules as some users use Cursor with .vscode
+        mcp_man.inject_copilot_instructions(mcp_servers)
+    else:
+        # Generic project, still inject rules for potential AI usage
+        mcp_man.inject_cursor_rules(mcp_servers)
+        mcp_man.inject_copilot_instructions(mcp_servers)
 
     # Start LSP proxies for any available external LSPs so MCP can route requests
     try:
