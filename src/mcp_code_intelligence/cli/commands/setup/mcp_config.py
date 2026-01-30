@@ -52,44 +52,6 @@ class MCPConfigManager:
             return git_manager.install_hooks()
         return False
 
-    def inject_vscode_settings(self, mcp_servers: dict):
-        """Inject MCP server configurations into .vscode/settings.json."""
-        vscode_dir = self.project_root / ".vscode"
-        vscode_dir.mkdir(exist_ok=True)
-        settings_path = vscode_dir / "settings.json"
-
-        settings = {}
-        if settings_path.exists():
-            try:
-                with open(settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f)
-            except Exception as e:
-                # Assuming 'logger' is defined elsewhere or should be 'self.console.print'
-                # For now, keeping it as is, but noting the potential undefined 'logger'
-                # If 'logger' is not defined, this would cause a NameError.
-                # Given the context, it's likely intended to be self.console.print
-                # However, the instruction did not ask to change this line, only to use 'mcpServers'
-                # which is already being done.
-                self.console.print(f"   ⚠️  Failed to load existing VS Code settings: {e}")
-
-        # Update mcpServers (Standard key for Cursor and VS Code MCP extensions)
-        current_servers = settings.get("mcpServers", {})
-        current_servers.update(mcp_servers)
-        settings["mcpServers"] = current_servers
-
-        # Also add under github.copilot.chat.mcpServers for the official Copilot extension support
-        # Note: This is a newer/experimental path and might require specific Copilot versions
-        copilot_mcp = settings.get("github.copilot.chat.mcpServers", {})
-        copilot_mcp.update(mcp_servers)
-        settings["github.copilot.chat.mcpServers"] = copilot_mcp
-
-        try:
-            with open(settings_path, "w", encoding="utf-8") as f:
-                json.dump(settings, f, indent=2)
-            self.console.print("   ✅ Configured .vscode/settings.json (mcpServers + github.copilot)")
-        except Exception as e:
-            self.console.print(f"   ⚠️  Failed to configure .vscode/settings.json: {e}")
-
     def inject_copilot_instructions(self, mcp_servers: dict):
         """Generate .github/copilot-instructions.md for GitHub Copilot."""
         copilot_dir = self.project_root / ".github"

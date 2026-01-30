@@ -81,11 +81,3 @@ class DiscoveryManager:
         """Check if uv is available."""
         return shutil.which("uv") is not None
 
-    def is_idx(self) -> bool:
-        """Detect if running in Google IDX environment."""
-        import os
-        return bool(os.getenv("IDX_WORKSPACE_ID") or (self.project_root / ".idx").exists())
-
-    def is_vscode(self) -> bool:
-        """Detect if proejct seems to be a VS Code/Copilot environment."""
-        return (self.project_root / ".vscode").exists() or (self.project_root / ".github").exists()

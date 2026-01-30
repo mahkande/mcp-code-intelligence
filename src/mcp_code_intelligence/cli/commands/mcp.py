@@ -260,6 +260,7 @@ def create_project_claude_config(
         "command": command,
         "args": args,
         "env": {
+            "MCP_PROJECT_ROOT": str(project_root.absolute()),
             "MCP_ENABLE_FILE_WATCHING": "true" if enable_file_watching else "false"
         },
     }
@@ -592,6 +593,7 @@ def configure_roo_code_mcp(
         "command": command,
         "args": args,
         "env": {
+            "MCP_PROJECT_ROOT": str(project_root.absolute()),
             "MCP_ENABLE_FILE_WATCHING": "true" if enable_file_watching else "false"
         },
         "disabled": False,
@@ -881,7 +883,8 @@ def configure_roo_code(
 ) -> None:
     """🤖 Configure MCP integration for Roo Code (VS Code).
 
-    Injects configuration into Roo Code's global settings file.
+    Configures both global Roo Code settings and project-level .mcp.json file.
+    Project-level configuration takes precedence and works better for multi-project setups.
     Works for Windows, macOS, and Linux.
 
     [bold cyan]Examples:[/bold cyan]
@@ -894,16 +897,30 @@ def configure_roo_code(
         # No init check required strictly, but good practice
         
         enable_file_watching = not no_watch
-        # Call the specific function directly since config_path is dynamic
+        
+        # Create project-level .mcp.json (recommended - takes precedence)
+        try:
+            create_project_claude_config(project_root, server_name, enable_file_watching)
+            print_info("✅ Created project-level .mcp.json (Roo Code will use this)")
+        except Exception as e:
+            print_warning(f"Failed to create project-level config: {e}")
+        
+        # Also configure global settings (fallback)
         from pathlib import Path
         success = configure_roo_code_mcp(
             project_root, server_name, enable_file_watching, force
         )
 
         if success:
-            print_info("Roo Code will detect the server (Action may require Reload Window)")
+            print_info("✅ Configured global Roo Code settings")
+            print_info("💡 Project-level .mcp.json takes precedence over global settings")
+            print_info("🔄 Roo Code will detect the server (Action may require Reload Window)")
         else:
-            raise typer.Exit(1)
+            # If global config fails but project-level succeeded, that's okay
+            if (project_root / ".mcp.json").exists():
+                print_info("⚠️  Global config update skipped, but project-level config exists")
+            else:
+                raise typer.Exit(1)
 
     except Exception as e:
         print_error(f"Configuration failed: {e}")

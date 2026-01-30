@@ -67,14 +67,23 @@ Standard AI assistants are "token-hungry." When you ask a simple question, they 
 Get up and running in any project in under a minute:
 
 ```bash
-# 1. Clone the repository to your local machine
+# 1. (Recommended) Create and activate a clean environment
+# Windows:
+python -m venv venv
+.\venv\Scripts\activate
+
+# Mac/Linux:
+# python3 -m venv venv
+# source venv/bin/activate
+
+# 2. Clone the repository to your local machine
 git clone https://github.com/mahkande/mcp-code-intelligence.git
 cd mcp-code-intelligence
 
-# 2. Install the package (This makes the 'mcp-code-intelligence' command available everywhere)
+# 3. Install the package (This makes the 'mcp-code-intelligence' command available everywhere)
 pip install .
 
-# 3. Initialize & Connect to your AI Editor
+# 4. Initialize & Connect to your AI Editor
 # Run this once. It auto-detects your editors (VS Code, Cursor, Claude) and configures them.
 mcp-code-intelligence setup
 ```

@@ -24,6 +24,8 @@ INDEXING-BEHAVIOR-REPORT.md
 INDEXING-OPTIMIZATION-SUMMARY.md
 JINA-DURUM.md
 VSCODE-MCP-CONFIG.md
+VSCODE_MCP_COZUM.md
+VSCODE_MCP_DURUM.md
 mcp-code-intelligence-dev
 
 # --- Unnecessary Node/Config Files ---
@@ -69,6 +71,11 @@ MODERNIZATION_REPORT.md
 MCP_SERVER_MODERNIZATION_REPORT.md
 MODERNIZATION_VALIDATION_REPORT.md
 security_scan.py
+debug_imports.py
+debug_imports_v2.py
+mcp_trace.py
+test_mcp_client.py
+verify_mcp.py
 src/mcp_code_intelligence/core/bm25_index.py
 src/mcp_code_intelligence/core/services/context.py
 src/mcp_code_intelligence/core/services/discovery.py
